@@ -24,6 +24,10 @@ func (s *Server) viewer(r *http.Request) liveproxy.Viewer {
 }
 
 func (s *Server) watchHLS(w http.ResponseWriter, r *http.Request) {
+	if s.d.Settings.MediaMTXAgentURL != nil {
+		writeError(w, http.StatusNotImplemented, "remote_media", "HLS fallback is disabled in remote mode so video stays between the browser and MediaMTX. Use WebRTC or connect directly to the media endpoint.")
+		return
+	}
 	path, file, err := liveproxy.SplitHLS(param(r, "*"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid", "Invalid path or file.")

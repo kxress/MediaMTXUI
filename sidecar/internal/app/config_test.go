@@ -151,6 +151,38 @@ func TestConfigAPI(t *testing.T) {
 	}
 }
 
+func TestRemoteConfigPinsPublicMediaOrigin(t *testing.T) {
+	env := map[string]string{
+		"MTXUI_MEDIAMTX_AGENT_URL":       "https://agent.example.test:9443",
+		"MTXUI_MEDIAMTX_AGENT_CA":        "/etc/mtxui/agent-ca.pem",
+		"MTXUI_MEDIAMTX_AGENT_CERT":      "/etc/mtxui/client.pem",
+		"MTXUI_MEDIAMTX_AGENT_KEY":       "/etc/mtxui/client-key.pem",
+		"MTXUI_MEDIAMTX_AGENT_AUTH_URL":  "http://127.0.0.1:9081/internal/auth",
+		"MTXUI_REMOTE_AGENT_ID":          "media-east",
+		"MTXUI_REMOTE_AGENT_AUTH_KEY":    strings.Repeat("a7", 32),
+		"MTXUI_MEDIAMTX_MEDIA_HOST":      "127.0.0.1",
+		"MTXUI_MEDIAMTX_WEBRTC_URL":      "https://media.example.test",
+		"MTXUI_PUBLIC_MEDIA_URL":         "https://media.example.test",
+		"MTXUI_MEDIAMTX_TRUSTED_PROXIES": "127.0.0.1/32",
+		"MTXUI_EXPOSURE_CONTROL":         "off",
+	}
+	h := newHarness(t, env, fast)
+	h.completeSetup()
+	info := configInfo(t, h)
+	if info.PublicMediaURL != "https://media.example.test" || info.Locked["webrtcAllowOrigins"] == "" ||
+		!strings.Contains(info.Content, `webrtcAllowOrigins: ["https://media.example.test"]`) {
+		t.Fatalf("remote public media configuration = url %q, lock %q, content:\n%s", info.PublicMediaURL, info.Locked["webrtcAllowOrigins"], info.Content)
+	}
+	if rec := h.do("PATCH", "/api/v1/config/global", map[string]any{"set": map[string]any{"webrtcAllowOrigins": []string{"*"}}}); rec.Code != http.StatusBadRequest || decode(rec)["error"] != "locked" {
+		t.Fatalf("wildcard WebRTC origin edit = %d %s", rec.Code, rec.Body)
+	}
+	var created StreamInfo
+	h.json(h.do("POST", "/api/v1/streams", map[string]any{"name": "live/alice"}), &created)
+	if created.MediaURL != "https://media.example.test" {
+		t.Fatalf("stream API public media URL = %q", created.MediaURL)
+	}
+}
+
 func TestDriftDismiss(t *testing.T) {
 	h := newHarness(t, nil, fast)
 	h.completeSetup()

@@ -6,8 +6,10 @@ The sidecar reads these environment variables. `compose.yaml` sets the ones an i
 
 | Variable | Default | Description |
 |---|---|---|
-| `MTXUI_PUBLIC_URL` | required | URL of the UI as users reach it, e.g. `https://mtx.example.com`. Its scheme decides the cookies' `Secure` flag, and state-changing requests must come from its origin. No path, query or credentials. |
+| `MTXUI_DEPLOYMENT_MODE` | `docker` | Runtime mode: `docker` preserves the existing Compose network defaults; `native` requires the MediaMTX Control API, metrics and playback listeners to be bound to loopback. |
+| `MTXUI_PUBLIC_URL` | required | URL of the management UI as administrators reach it, e.g. `https://ui.example.com`; it may be VPN-only. Its scheme decides the cookies' `Secure` flag, and state-changing requests must come from its origin. No path, query or credentials. |
 | `MTXUI_PUBLIC_HOST` | required | Hostname or IP address that stream clients connect to. Offered to WebRTC clients as the ICE host. |
+| `MTXUI_PUBLIC_MEDIA_URL` | not set | Optional public HTTPS origin for MediaMTX's browser page and direct WHIP/WHEP signaling, separate from the UI origin. Required in remote agent mode. Point it at MediaMTX's WebRTC HTTP listener or a TLS reverse proxy that forwards that listener; WebRTC ICE media must still reach the MediaMTX host directly. |
 | `MTXUI_TRUSTED_PROXIES` | not set | Comma-separated IPs or CIDRs of reverse proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` headers are believed. For a proxy on the Docker host, the gateway of the stack subnet. Trusting every address (`0.0.0.0/0`, `::/0`) is refused. |
 | `MTXUI_STACK_SUBNET` | not set | CIDR of the stack's Docker network, used for MediaMTX's trusted proxies. Detected from the sidecar's own address when not set. |
 | `MTXUI_LISTEN` | `:9080` | Public listener (UI, API, proxies): HTTPS with `MTXUI_TLS=acme`, else plain HTTP to publish only behind your reverse proxy. |
@@ -20,8 +22,23 @@ The sidecar reads these environment variables. `compose.yaml` sets the ones an i
 | `MTXUI_INTERNAL_LISTEN` | `:9081` | Internal listener for MediaMTX's authentication callback and the healthcheck. Never publish it. |
 | `MTXUI_INTERNAL_URL` | `http://sidecar:9081` | How MediaMTX reaches the internal listener; written into `mediamtx.yml` as the base of `authHTTPAddress`. |
 | `MTXUI_MEDIAMTX_HOST` | `mediamtx` | MediaMTX's hostname on the stack network. |
+| `MTXUI_MEDIAMTX_AGENT_URL` | not set | Optional HTTPS origin of a remote mtxui agent, for example `https://media-agent.example.net:9443`. The agent relays only documented MediaMTX Control API operations over mutually authenticated TLS. |
+| `MTXUI_MEDIAMTX_AGENT_CA` | not set | Absolute path to the CA certificate that issued the remote agent's server certificate; required with MTXUI_MEDIAMTX_AGENT_URL. |
+| `MTXUI_MEDIAMTX_AGENT_CERT` | not set | Absolute path to the client certificate MediaMTXUI presents to the remote agent; required with MTXUI_MEDIAMTX_AGENT_URL. |
+| `MTXUI_MEDIAMTX_AGENT_KEY` | not set | Absolute path to the client private key MediaMTXUI presents to the remote agent; required with MTXUI_MEDIAMTX_AGENT_URL. |
+| `MTXUI_MEDIAMTX_AGENT_AUTH_URL` | not set | Loopback HTTP URL of the remote agent's local auth callback, for example `http://127.0.0.1:9081/internal/auth`; required with MTXUI_MEDIAMTX_AGENT_URL and must match MTXUI_AGENT_AUTH_LISTEN on that host. |
+| `MTXUI_REMOTE_AGENT_ID` | not set | Identifier of the agent allowed to forward MediaMTX authentication callbacks to this instance. Required with MTXUI_MEDIAMTX_AGENT_URL. |
+| `MTXUI_REMOTE_AGENT_AUTH_KEY` | not set | Hex-encoded 32-byte HMAC key shared with the remote agent for authenticated, replay-resistant MediaMTX callbacks; required with MTXUI_MEDIAMTX_AGENT_URL. Keep it secret and rotate it on both hosts together. |
+| `MTXUI_MEDIAMTX_CONTROL_HOST` | not set | Host address MediaMTX binds for its private Control API, metrics, and playback listeners. Empty keeps the Compose network bind; set to 127.0.0.1 for native local operation. Remote agent mode always locks these listeners to loopback. |
+| `MTXUI_MEDIAMTX_MEDIA_HOST` | not set | Optional host address MediaMTX binds for HLS and WebRTC signalling listeners. Empty follows MTXUI_MEDIAMTX_CONTROL_HOST for Docker and native local operation. Remote agent mode requires an explicit media bind address, separate from the loopback-only administrative APIs. |
+| `MTXUI_MEDIAMTX_WEBRTC_URL` | not set | Optional HTTPS origin used by the dashboard when forwarding WebRTC signalling. Required in remote agent mode so SDP offers, viewer tickets and session control are encrypted between the management and media hosts; it may point to MediaMTX TLS or an HTTPS reverse proxy. |
+| `MTXUI_MEDIAMTX_TRUSTED_PROXIES` | not set | Comma-separated IPs or CIDRs of reverse proxies MediaMTX sees in front of its HTTP listeners. MediaMTX trusts their X-Forwarded-For headers when binding credentials to the real publisher/viewer address; do not trust networks that can connect directly. |
 | `MTXUI_DATA_DIR` | `/data` | Data root: `config/` (mediamtx.yml), `state/` (database and secrets), `logs/`, `recordings/`, `hooks/`, `backups/`. |
 | `MTXUI_HOLDING_DIR` | `/holding` | Holding clips, played while nobody streams to a stream. MediaMTX must see the directory at the same path (read-only), since `mediamtx.yml` names the files by it. |
+| `MTXUI_MEDIAMTX_LOG_PATH` | `/logs/mediamtx.log` | MediaMTX log file path as seen by MediaMTX. In local operation, set `MTXUI_MEDIAMTX_LOG_DATA_PATH` to the same host file. |
+| `MTXUI_MEDIAMTX_LOG_DATA_PATH` | not set | Local path MediaMTX UI reads for MediaMTX logs. Empty uses `MTXUI_DATA_DIR/logs/mediamtx.log`; native local operation can set this to the same host path as `MTXUI_MEDIAMTX_LOG_PATH`. |
+| `MTXUI_MEDIAMTX_RECORDINGS_DIR` | `/recordings` | Recording directory as seen by MediaMTX. In local operation, set `MTXUI_RECORDINGS_DATA_DIR` to the same host directory; Docker keeps its existing `/recordings` volume. |
+| `MTXUI_RECORDINGS_DATA_DIR` | not set | Local path MediaMTX UI uses for recording disk accounting. Empty uses `MTXUI_DATA_DIR/recordings`; set it to the same host directory as `MTXUI_MEDIAMTX_RECORDINGS_DIR` for a native local instance. |
 | `MTXUI_RECORDINGS_MAX_GB` | `0` | Storage budget for recordings in GB (decimals allowed); the oldest segments are deleted, through MediaMTX's API, to stay under it. 0 means no budget (free space still applies). Files MediaMTX does not list count toward it but are never deleted; a banner says so when they alone exceed it. |
 | `MTXUI_RECORDINGS_MIN_FREE_GB` | `20` | Free space to keep on the recordings filesystem: below it, the oldest segments are deleted. |
 | `MTXUI_RECORDINGS_CRITICAL_FREE_GB` | `5` | Free space below which recording is switched off for every path (with a banner and an audit entry) until an admin switches it back on. Less than MTXUI_RECORDINGS_MIN_FREE_GB, unless that is 0. |
@@ -41,5 +58,6 @@ The sidecar reads these environment variables. `compose.yaml` sets the ones an i
 | `MTXUI_SESSION_IDLE_TIMEOUT` | `12h` | A session ends after this long without a request (5m to 720h). |
 | `MTXUI_SESSION_MAX_AGE` | `168h` | A session ends this long after sign-in, however active (at least the idle timeout, at most 2160h). |
 | `MTXUI_LOGIN_RATE_PER_MINUTE` | `20` | Sign-in attempts allowed per client IP and minute (1 to 600). |
+| `MTXUI_JOIN_RATE_PER_MINUTE` | `10` | Account-join attempts allowed per client IP and minute (1 to 600). |
 | `MTXUI_LOCKOUT_THRESHOLD` | `5` | Failed sign-ins for one username from one client address before that address is locked out of it (1 to 100), so a stranger cannot lock you out everywhere. Unknown usernames lock the same way, so locks reveal nothing. |
 | `MTXUI_LOCKOUT_DURATION` | `15m` | How long a locked username stays locked (1m to 24h). |

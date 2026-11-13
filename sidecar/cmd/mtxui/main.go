@@ -32,6 +32,7 @@ import (
 	"mtxui/internal/live"
 	"mtxui/internal/liveproxy"
 	"mtxui/internal/logs"
+	"mtxui/internal/mtxagent"
 	"mtxui/internal/mtxapi"
 	"mtxui/internal/mtxauth"
 	"mtxui/internal/mtxconf"
@@ -59,15 +60,29 @@ func run(args []string) int {
 	switch cmd {
 	case "serve":
 		return serve()
+	case "agent":
+		return agentServe()
 	case "healthcheck":
 		return healthcheck()
-	case "setup-token": // for `docker compose exec sidecar /mtxui setup-token`: the scratch image has no cat
-		cfg, err := settings.Load(os.Getenv)
+	case "setup-token": // the scratch image has no cat; native users can call this through the installed CLI wrapper
+		dataDir := strings.TrimSpace(os.Getenv("MTXUI_DATA_DIR"))
+		if dataDir == "" {
+			dataDir = "/data"
+		}
+		root, err := os.OpenRoot(dataDir)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "mtxui: invalid settings:\n%v\n", err)
+			fmt.Fprintln(os.Stderr, "mtxui: cannot open the data directory:", err)
 			return 1
 		}
-		b, err := os.ReadFile(filepath.Join(cfg.StateDir(), "setup-token"))
+		f, err := root.Open("state/setup-token")
+		if err != nil {
+			_ = root.Close()
+			fmt.Fprintln(os.Stderr, "mtxui: no setup token: setup is done (or the sidecar has not started yet)")
+			return 1
+		}
+		b, err := io.ReadAll(f)
+		_ = f.Close()
+		_ = root.Close()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "mtxui: no setup token: setup is done (or the sidecar has not started yet)")
 			return 1
@@ -100,22 +115,40 @@ func run(args []string) int {
 		}
 		return cli.Credential(ctx, core, args, streams)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: mtxui [serve|healthcheck|version|setup-token|setup|credential|reset-password]")
+		fmt.Fprintln(os.Stderr, "usage: mtxui [serve|agent|healthcheck|version|setup-token|setup|credential|reset-password]")
 		return 2
 	}
 }
 
+func agentServe() int {
+	cfg, err := mtxagent.LoadConfig(os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mtxui agent: invalid settings, refusing to start:\n%v\n", err)
+		return 1
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := mtxagent.Run(ctx, cfg, log); err != nil {
+		log.Error("agent stopped", "err", err)
+		return 1
+	}
+	return 0
+}
+
 // core holds what both the server and the subcommands need.
 type core struct {
-	cfg       *settings.Settings
-	store     *store.Store
-	creds     *credentials.Service
-	writer    *mtxconf.Writer
-	validator mtxconf.Validator
-	clips     *app.HoldingClips // read uploaded holding clips: the config check's stand-ins, the read-back's allowance
-	setup     *setup.Service
-	hasher    *auth.Hasher
-	audit     *audit.Recorder
+	cfg          *settings.Settings
+	store        *store.Store
+	creds        *credentials.Service
+	writer       *mtxconf.Writer
+	validator    mtxconf.Validator
+	agentClient  *http.Client
+	remoteConfig mtxconf.RemoteConfig
+	clips        *app.HoldingClips // read uploaded holding clips: the config check's stand-ins, the read-back's allowance
+	setup        *setup.Service
+	hasher       *auth.Hasher
+	audit        *audit.Recorder
 	// subnetSure: cfg.StackSubnet was set, or detected on the only network there is (detectSubnet)
 	subnetSure bool
 }
@@ -136,6 +169,11 @@ func open(ctx context.Context, cfg *settings.Settings, log *slog.Logger) (*core,
 			return nil, err
 		}
 	}
+	for _, dir := range []string{filepath.Dir(cfg.MediaMTXLog()), cfg.RecordingDataDir(), cfg.HoldingDir} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return nil, err
+		}
+	}
 	st, err := store.Open(ctx, cfg.DBPath())
 	if err != nil {
 		return nil, err
@@ -146,6 +184,10 @@ func open(ctx context.Context, cfg *settings.Settings, log *slog.Logger) (*core,
 		return nil, err
 	}
 	clips := app.NewHoldingClips(cfg.HoldingDir, log)
+	webRTCOrigin := ""
+	if cfg.MediaMTXAgentURL != nil {
+		webRTCOrigin = cfg.PublicMediaOrigin()
+	}
 	c := &core{
 		cfg: cfg, store: st, creds: credentials.New(st, key), clips: clips,
 		validator: mtxconf.Validator{Bin: cfg.MediaMTXBin, StandIn: clips.StandIn},
@@ -153,7 +195,25 @@ func open(ctx context.Context, cfg *settings.Settings, log *slog.Logger) (*core,
 	}
 	c.writer = &mtxconf.Writer{
 		Path: cfg.ConfigFile(), LockPath: filepath.Join(cfg.StateDir(), "config.lock"),
-		Rules: mtxconf.Rules{AuthURL: cfg.AuthURL()}, Checker: c.validator, Store: st,
+		Rules: mtxconf.Rules{
+			AuthURL: cfg.MediaMTXAuthURL(), WebRTCOrigin: webRTCOrigin, RecordingsDir: cfg.MediaMTXRecordingsDir,
+			TrustedProxies: cfg.MediaMTXTrustedProxies,
+			PrivateControl: cfg.DeploymentMode == "native" || cfg.MediaMTXAgentURL != nil,
+		},
+		Checker: c.validator, Store: st,
+	}
+	if cfg.MediaMTXAgentURL != nil {
+		c.agentClient, err = mtxagent.NewClient(cfg.MediaMTXAgentCert, cfg.MediaMTXAgentKey, cfg.MediaMTXAgentCA)
+		if err != nil {
+			_ = st.Close()
+			return nil, fmt.Errorf("configure remote MediaMTX agent TLS: %w", err)
+		}
+		c.remoteConfig, err = mtxagent.NewRemoteConfigClient(cfg.MediaMTXAgentURL.String(), c.agentClient)
+		if err != nil {
+			_ = st.Close()
+			return nil, err
+		}
+		c.writer.Remote = c.remoteConfig
 	}
 	c.setup = &setup.Service{
 		Store: st, Hasher: c.hasher, Writer: c.writer, Seed: c.seed,
@@ -163,9 +223,19 @@ func open(ctx context.Context, cfg *settings.Settings, log *slog.Logger) (*core,
 }
 
 func (c *core) seed(in setup.Ingest) ([]byte, error) {
+	stackSubnet := c.cfg.StackSubnet
+	controlHost := c.cfg.MediaMTXControlHost
+	if c.cfg.MediaMTXAgentURL != nil {
+		// The UI host's local network is not necessarily a proxy network trusted by a remote media host.
+		stackSubnet = netip.Prefix{}
+		controlHost = "127.0.0.1"
+	}
 	return mtxconf.Seed(mtxconf.SeedParams{
-		MediaMTXVersion: buildinfo.MediaMTXVersion, AuthURL: c.cfg.AuthURL(),
-		PublicHost: c.cfg.PublicHost, StackSubnet: c.cfg.StackSubnet, RTSP: in.RTSP, RTMP: in.RTMP, SRT: in.SRT,
+		MediaMTXVersion: buildinfo.MediaMTXVersion, AuthURL: c.cfg.MediaMTXAuthURL(),
+		PublicHost: c.cfg.PublicHost, WebRTCOrigin: c.cfg.PublicMediaOrigin(), StackSubnet: stackSubnet, TrustedProxies: c.cfg.MediaMTXTrustedProxies,
+		ControlHost: controlHost, MediaHost: c.cfg.MediaMTXMediaHost,
+		LogFile: c.cfg.MediaMTXLogFile, RecordingsDir: c.cfg.MediaMTXRecordingsDir,
+		RTSP: in.RTSP, RTMP: in.RTMP, SRT: in.SRT,
 	})
 }
 
@@ -241,7 +311,7 @@ func start(ctx context.Context, cfg *settings.Settings, log *slog.Logger, logHub
 	}
 
 	// Only for a subnet that is surely the stack's: detectSubnet may have taken another network's, and open() said so.
-	if c.subnetSure {
+	if c.subnetSure && cfg.MediaMTXAgentURL == nil {
 		if changed, err := c.writer.SyncTrustedProxies(ctx, cfg.StackSubnet); err != nil {
 			log.Warn("setting MediaMTX's trusted proxies to the stack subnet", "subnet", cfg.StackSubnet, "err", err)
 		} else if changed {
@@ -254,9 +324,12 @@ func start(ctx context.Context, cfg *settings.Settings, log *slog.Logger, logHub
 		return err
 	}
 	// UI edits are read back from MediaMTX after they are written, and undone if MediaMTX stops answering.
-	mtxAPI := &mtxconf.APIClient{Base: cfg.MediaMTXURL(settings.MediaMTXAPIPort), Principal: principal}
+	apiURL := cfg.MediaMTXAPIURL()
+	mtxAPI := &mtxconf.APIClient{Base: apiURL, Principal: principal, Client: c.agentClient}
 	c.writer.Verifier = &mtxconf.Verifier{API: mtxAPI, Allowance: c.clips.Allowance}
-	go c.clips.CheckAll(ctx) // until a clip is read, config checks read it themselves
+	if cfg.MediaMTXAgentURL == nil {
+		go c.clips.CheckAll(ctx) // until a clip is read, config checks read it themselves
+	}
 	mtxAuth := mtxauth.NewHandler(principal, c.creds, log)
 	notes := mtxlog.New() // what MediaMTX's log says about encoders, for the stream pages
 	c.writer.MinGap = mtxconf.ReloadGap
@@ -264,16 +337,22 @@ func start(ctx context.Context, cfg *settings.Settings, log *slog.Logger, logHub
 	if err != nil {
 		return err
 	}
-	apiURL := cfg.MediaMTXURL(settings.MediaMTXAPIPort)
 	prox, err := proxy.New(ops, apiURL, principal, app.RoleOf)
 	if err != nil {
 		return err
 	}
+	prox.SetHTTPClient(c.agentClient)
 	hub, err := live.New(apiURL, principal, ops, log)
 	if err != nil {
 		return err
 	}
+	hub.SetHTTPClient(c.agentClient)
 	prober := probe.New(apiURL, principal, buildinfo.MediaMTXVersion, cfg.PublicHost, log)
+	prober.SetHTTPClient(c.agentClient)
+	prober.SkipExposureCheck = cfg.MediaMTXAgentURL != nil
+	if cfg.MediaMTXAgentURL != nil {
+		prober.SetManagementHealthURL(strings.TrimSuffix(cfg.MediaMTXAgentURL.String(), "/") + "/v1/health")
+	}
 	prober.StackSubnet = cfg.StackSubnet
 	sessions := auth.NewSessions(c.store, cfg.Secure(), cfg.SessionIdleTimeout, cfg.SessionMaxAge)
 	// Exposure control: the host helper reads desired.json from portgate/ and writes its status into portgate-status/
@@ -283,12 +362,21 @@ func start(ctx context.Context, cfg *settings.Settings, log *slog.Logger, logHub
 		StatusPath: filepath.Join(cfg.DataDir, "portgate-status", portgate.StatusFile),
 		ManualPath: filepath.Join(cfg.DataDir, "state", "exposure-manual.json"),
 	}
+	var playback app.Playback
+	if cfg.MediaMTXAgentURL == nil {
+		playback = &mtxconf.APIClient{Base: cfg.MediaMTXURL(settings.MediaMTXPlaybackPort), Principal: principal}
+	}
+	var agentVerifier app.RemoteAgentAuthVerifier
+	if cfg.MediaMTXAgentURL != nil {
+		agentVerifier = &mtxagent.Verifier{AgentID: cfg.RemoteAgentID, Key: cfg.RemoteAgentAuthKey}
+	}
 	srv := app.New(app.Deps{
 		Settings: cfg, Store: c.store, Sessions: sessions, Hasher: c.hasher, Setup: c.setup,
 		Probe: prober, Audit: c.audit, Live: hub, Config: c.writer, NetGuard: netguard.New(cfg.StackSubnet), Creds: c.creds, Opened: mtxAuth,
 		Kicker: mtxAPI, MTX: mtxAPI, Notes: notes, Logs: logHub,
-		Playback: &mtxconf.APIClient{Base: cfg.MediaMTXURL(settings.MediaMTXPlaybackPort), Principal: principal}, Watch: liveproxy.New(cfg.MediaMTXURL(8888), cfg.MediaMTXURL(8889), mtxAuth.Viewers),
-		Exposure: exposure, Proxy: prox, MTXAuth: mtxAuth,
+		Playback: playback, Watch: liveproxy.New(cfg.MediaMTXURL(settings.MediaMTXHLSPort), cfg.MediaMTXWebRTCBaseURL(), mtxAuth.Viewers),
+		AgentAuthVerifier: agentVerifier,
+		Exposure:          exposure, Proxy: prox, MTXAuth: mtxAuth,
 		UI: webui.Handler(), Log: log, Restart: restart, HoldingClips: c.clips,
 	})
 
@@ -300,14 +388,16 @@ func start(ctx context.Context, cfg *settings.Settings, log *slog.Logger, logHub
 	}
 	notes.OnRefused = srv.FollowEncoder                                           // the holding version follows the encoder's audio
 	notes.OnLine = func(line string) { logHub.Publish(logs.ParseMediaMTX(line)) } // the log viewer's live tail
-	go notes.Follow(ctx, cfg.MediaMTXLog(), time.Second)
-	go logs.RunRotation(ctx, cfg.MediaMTXLog(), cfg.MediaMTXLogMaxBytes, cfg.MediaMTXLogKeep, time.Minute, func(err error) {
-		if err != nil {
-			log.Warn("rotating MediaMTX's log", "err", err)
-		} else {
-			log.Info("rotated MediaMTX's log", "keep", cfg.MediaMTXLogKeep)
-		}
-	})
+	if cfg.MediaMTXAgentURL == nil {
+		go notes.Follow(ctx, cfg.MediaMTXLog(), time.Second)
+		go logs.RunRotation(ctx, cfg.MediaMTXLog(), cfg.MediaMTXLogMaxBytes, cfg.MediaMTXLogKeep, time.Minute, func(err error) {
+			if err != nil {
+				log.Warn("rotating MediaMTX's log", "err", err)
+			} else {
+				log.Info("rotated MediaMTX's log", "keep", cfg.MediaMTXLogKeep)
+			}
+		})
+	}
 
 	token, err := c.setup.EnsureToken(ctx)
 	if err != nil {
@@ -318,7 +408,12 @@ func start(ctx context.Context, cfg *settings.Settings, log *slog.Logger, logHub
 	}
 
 	go prober.Run(ctx)
-	go c.writer.Watch(ctx, 2*time.Second, locked, func(out mtxconf.Outcome, err error) {
+	driftInterval := 2 * time.Second
+	if c.writer.Remote == nil {
+		// A local file read is cheap, so detect and repair outside edits promptly. Keep remote agent polling less chatty.
+		driftInterval = 500 * time.Millisecond
+	}
+	go c.writer.Watch(ctx, driftInterval, locked, func(out mtxconf.Outcome, err error) {
 		reportDrift(ctx, c, prober, log, out, err)
 	})
 	go hub.Run(ctx) // when ctx ends, it closes the event streams, so shutdown need not wait for them
@@ -328,7 +423,9 @@ func start(ctx context.Context, cfg *settings.Settings, log *slog.Logger, logHub
 	}
 	go srv.RunAccess(ctx)                    // closes live views, guest sessions and the like whose access has ended
 	go mtxAuth.RunSessions(ctx, mtxAPI, hub) // disconnects anonymous readers of streams made private
-	go srv.RunRecordings(ctx)
+	if cfg.MediaMTXAgentURL == nil {
+		go srv.RunRecordings(ctx)
+	}
 	go srv.RunHistory(ctx)
 	go srv.RunBackups(ctx)
 	go srv.RunUpdates(ctx) // daily: is there a newer release (MTXUI_UPDATE_CHECK, the dashboard's switch)
@@ -378,7 +475,7 @@ func banner(w io.Writer, cfg *settings.Settings, token string) {
 		"MediaMTX UI first-run setup\n\n"+
 		"Open %s/setup and enter this setup token:\n\n"+
 		"    %s\n\n"+
-		"Show it again with: docker compose exec sidecar /mtxui setup-token\n"+
+		"Show it again with: mtxui setup-token (native) or docker compose exec sidecar /mtxui setup-token (Docker)\n"+
 		"It is also in %s. It stops working once setup is done.\n"+
 		"==================================================================\n\n",
 		cfg.Origin(), token, filepath.Join(cfg.StateDir(), "setup-token"))

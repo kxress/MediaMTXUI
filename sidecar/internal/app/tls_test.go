@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -22,7 +23,19 @@ func TestRunTLS(t *testing.T) {
 	ts.StartTLS()
 	cert := ts.TLS.Certificates[0]
 	ts.Close()
-	pub, internal, plain := freeAddr(t), freeAddr(t), freeAddr(t)
+	reserved := make([]net.Listener, 3)
+	addresses := make([]string, len(reserved))
+	for i := range reserved {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		reserved[i], addresses[i] = ln, ln.Addr().String()
+	}
+	for _, ln := range reserved {
+		_ = ln.Close()
+	}
+	pub, internal, plain := addresses[0], addresses[1], addresses[2]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -56,14 +69,24 @@ func TestRunTLS(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Strict-Transport-Security") == "" || resp.ProtoMajor != 2 {
 		t.Fatalf("https: %d, HSTS %q, HTTP/%d", resp.StatusCode, resp.Header.Get("Strict-Transport-Security"), resp.ProtoMajor)
 	}
-	req, _ := http.NewRequest(http.MethodGet, "http://"+plain+"/streams?x=1", nil)
-	req.Host = "evil.example"
-	if resp, err := client.Do(req); err != nil || resp.StatusCode != http.StatusMovedPermanently ||
-		resp.Header.Get("Location") != origin+"/streams?x=1" {
-		t.Fatalf("redirect: %v %v", resp, err)
-	} else {
-		_ = resp.Body.Close()
+	deadline = time.Now().Add(5 * time.Second)
+	var redirectErr error
+	for {
+		req, _ := http.NewRequest(http.MethodGet, "http://"+plain+"/streams?x=1", nil)
+		req.Host = "evil.example"
+		resp, redirectErr = client.Do(req)
+		if redirectErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("redirect: %v %v", resp, redirectErr)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	if resp.StatusCode != http.StatusMovedPermanently || resp.Header.Get("Location") != origin+"/streams?x=1" {
+		t.Fatalf("redirect: %d %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	_ = resp.Body.Close()
 	if resp, err := client.Post("http://"+plain+"/api/v1/auth/login", "application/json", nil); err != nil || resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("a POST to plain HTTP: %v %v", resp, err)
 	} else {

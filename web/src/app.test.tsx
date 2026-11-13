@@ -223,7 +223,7 @@ describe('shell', () => {
     expect(screen.getByTestId('mediamtx-unreachable')).toHaveTextContent(
       "MediaMTX's API does not answer",
     )
-    expect(screen.getByTestId('mediamtx-status')).toHaveTextContent('Unreachable')
+    expect(screen.getByTestId('mediamtx-status')).toHaveTextContent('Control API unavailable')
 
     await stream(
       ['status', { reachable: true, since: new Date().toISOString() }],
@@ -233,6 +233,35 @@ describe('shell', () => {
     expect(screen.queryByTestId('mediamtx-unreachable')).not.toBeInTheDocument()
     expect(screen.queryByTestId('online-path-test')).not.toBeInTheDocument()
     expect(screen.getByText(/Nothing is being published/)).toBeInTheDocument()
+  })
+
+  it('reports an unavailable remote agent without claiming MediaMTX stopped', async () => {
+    fakeSidecar({
+      session: adminSession,
+      status: {
+        ...healthyStatus,
+        reachable: false,
+        failure: 'management_unavailable',
+        managementReachable: false,
+      },
+    })
+    renderApp('/')
+    await stream(['snapshot', liveSnapshot])
+    await stream([
+      'status',
+      {
+        reachable: false,
+        since: new Date().toISOString(),
+        error: 'remote management connection failed',
+      },
+    ])
+    expect(await screen.findByTestId('mediamtx-unreachable')).toHaveTextContent(
+      'MediaMTX management connection is unavailable',
+    )
+    expect(screen.getByTestId('mediamtx-unreachable')).toHaveTextContent(
+      'media server state is unknown',
+    )
+    expect(screen.getByTestId('mediamtx-status')).toHaveTextContent('Management unavailable')
   })
 
   it('goes to sign-in when the stream says the session ended, and comes back afterwards', async () => {

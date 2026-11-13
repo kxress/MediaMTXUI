@@ -26,6 +26,7 @@ export const configSchema = z.object({
   settings: settingsValue.nullable(),
   locked: z.record(z.string(), z.string()),
   publicHost: z.string(),
+  publicMediaURL: z.string().optional(),
 })
 export type Config = z.infer<typeof configSchema>
 

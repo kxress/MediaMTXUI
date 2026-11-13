@@ -10,6 +10,11 @@ export const healthSchema = z.object({
   status: z.literal('ok'),
   version: z.string(),
   mediamtxVersion: z.string(),
+  remoteAgent: z.boolean(),
+  hlsFallback: z.boolean(),
+  recordingFiles: z.boolean(),
+  mediaLogs: z.boolean(),
+  holdingUpload: z.boolean(),
 })
 export type Health = z.infer<typeof healthSchema>
 
@@ -34,6 +39,10 @@ export const statusSchema = z.object({
   version: z.string(),
   expectedVersion: z.string(),
   apiProtected: z.boolean().nullable(),
+  failure: z.enum(['management_unavailable', 'media_api_unavailable']).optional(),
+  managementReachable: z.boolean().optional(),
+  managementVersion: z.string().optional(),
+  managementCapabilities: z.array(z.string()).optional(),
   unsafe: z.string().optional(),
   warnings: z.array(z.object({ code: z.string(), message: z.string() })),
   /** Exposure control (MTXUI_EXPOSURE_CONTROL): the Exposure page and automatic exposure. */

@@ -312,7 +312,9 @@ function CreatedPanel({ credential: c, onClose }: { credential: Credential; onCl
   const onePath =
     c.paths.length === 1 && !c.paths[0]?.startsWith('~') ? (c.paths[0] ?? '') : '<path>'
   const mode = c.actions.includes('publish') ? 'publish' : 'read'
-  const rtc = config ? rtcAddress(window.location.origin, global, onePath, mode) : null
+  const rtc = config
+    ? rtcAddress(window.location.origin, global, onePath, mode, config.publicMediaURL)
+    : null
   const urls = [
     ...(c.kind === 'password' && config
       ? credentialAddresses(config.publicHost, global, onePath, c.name, secret, mode)

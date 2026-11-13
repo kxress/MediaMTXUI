@@ -28,13 +28,17 @@ type Warning struct {
 
 // Status is the probe's latest view.
 type Status struct {
-	CheckedAt       time.Time `json:"checkedAt"`
-	Reachable       bool      `json:"reachable"`
-	Version         string    `json:"version"`
-	ExpectedVersion string    `json:"expectedVersion"`
-	APIProtected    *bool     `json:"apiProtected"`     // nil until known
-	Unsafe          string    `json:"unsafe,omitempty"` // set while the sidecar refuses to serve
-	Warnings        []Warning `json:"warnings"`
+	CheckedAt              time.Time `json:"checkedAt"`
+	Reachable              bool      `json:"reachable"` // MediaMTX Control API
+	Version                string    `json:"version"`
+	ExpectedVersion        string    `json:"expectedVersion"`
+	APIProtected           *bool     `json:"apiProtected"` // nil until known
+	Unsafe                 string    `json:"unsafe,omitempty"`
+	Failure                string    `json:"failure,omitempty"` // management_unavailable or media_api_unavailable
+	ManagementReachable    *bool     `json:"managementReachable,omitempty"`
+	ManagementVersion      string    `json:"managementVersion,omitempty"`
+	ManagementCapabilities []string  `json:"managementCapabilities,omitempty"`
+	Warnings               []Warning `json:"warnings"`
 }
 
 // Authorizer adds the sidecar's credentials to a request.
@@ -44,17 +48,20 @@ type Authorizer interface {
 
 // Prober checks MediaMTX periodically.
 type Prober struct {
-	api        string
-	principal  Authorizer
-	expected   string
-	publicHost string
-	client     *http.Client
-	dial       func(ctx context.Context, network, addr string) (net.Conn, error)
-	lookup     func(ctx context.Context, host string) ([]netip.Addr, error)
-	log        *slog.Logger
+	api              string
+	managementHealth string
+	principal        Authorizer
+	expected         string
+	publicHost       string
+	client           *http.Client
+	dial             func(ctx context.Context, network, addr string) (net.Conn, error)
+	lookup           func(ctx context.Context, host string) ([]netip.Addr, error)
+	log              *slog.Logger
 
 	// StackSubnet is the stack network's (settings.StackSubnet). A PUBLIC_HOST there is no test of publishing.
 	StackSubnet netip.Prefix
+	// SkipExposureCheck is set when a remote agent is the private Control API transport; PUBLIC_HOST belongs to the media host.
+	SkipExposureCheck bool
 
 	mu       sync.RWMutex
 	status   Status
@@ -84,9 +91,13 @@ func New(api string, principal Authorizer, expected, publicHost string, log *slo
 // 10 minutes. It returns when ctx ends.
 func (p *Prober) Run(ctx context.Context) {
 	var lastExposure time.Time
+	mediaSeen := false
 	for {
 		p.Check(ctx)
-		if time.Since(lastExposure) > 10*time.Minute {
+		if p.Status().Reachable {
+			mediaSeen = true
+		}
+		if mediaSeen && time.Since(lastExposure) > 10*time.Minute {
 			p.CheckExposure(ctx)
 			lastExposure = time.Now()
 		}
@@ -105,8 +116,19 @@ func (p *Prober) Run(ctx context.Context) {
 // Check asks MediaMTX's API for its paths without credentials (must be refused) and for its version with them.
 func (p *Prober) Check(ctx context.Context) {
 	st := Status{CheckedAt: time.Now(), ExpectedVersion: p.expected}
+	if p.managementHealth != "" {
+		ok, version, capabilities := p.checkManagement(ctx)
+		st.ManagementReachable = &ok
+		st.ManagementVersion = version
+		st.ManagementCapabilities = capabilities
+		if !ok {
+			st.Failure = "management_unavailable"
+			p.updateStatus(st)
+			return
+		}
+	}
 	code, _, err := p.get(ctx, "/v3/paths/list", false)
-	if err == nil {
+	if err == nil && (code == http.StatusUnauthorized || code == http.StatusForbidden || code == http.StatusOK) {
 		st.Reachable = true
 		switch code {
 		case http.StatusUnauthorized:
@@ -126,15 +148,21 @@ func (p *Prober) Check(ctx context.Context) {
 				st.Version = strings.TrimPrefix(info.Version, "v")
 			}
 		}
+	} else {
+		st.Failure = "media_api_unavailable"
 	}
 
+	p.updateStatus(st)
+}
+
+func (p *Prober) updateStatus(st Status) {
 	p.mu.Lock()
 	prev := p.status
 	st.Warnings = nil
 	p.status = st
 	switch {
 	case st.Version != "" && st.Version != p.expected:
-		p.warnings["version"] = Warning{"version", fmt.Sprintf("MediaMTX is version %s, but this sidecar was built for %s. Deploy the matching pair: download the release's compose.yaml (README: Upgrading).", st.Version, p.expected)}
+		p.warnings["version"] = Warning{"version", fmt.Sprintf("MediaMTX is version %s, but this MediaMTXUI release was built for %s. Confirm that the deployed MediaMTX version is compatible with this release.", st.Version, p.expected)}
 	default:
 		delete(p.warnings, "version")
 	}
@@ -151,11 +179,33 @@ func (p *Prober) Check(ctx context.Context) {
 	}
 }
 
+func (p *Prober) checkManagement(ctx context.Context) (bool, string, []string) {
+	code, body, err := p.getURL(ctx, p.managementHealth, false)
+	if err != nil || code != http.StatusOK {
+		return false, "", nil
+	}
+	var health struct {
+		Status       string   `json:"status"`
+		Version      string   `json:"version"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if json.Unmarshal(body, &health) != nil || health.Status != "ok" {
+		return false, "", nil
+	}
+	return true, health.Version, health.Capabilities
+}
+
 // CheckExposure warns about each never-published MediaMTX port that accepts TCP connections at PUBLIC_HOST. From
 // inside the stack this cannot prove a port is closed to the internet, so it only ever warns. A PUBLIC_HOST on the
 // stack's own network or on loopback (the e2e stack names the mediamtx container) reaches those ports whether or not
 // anything is published, so there is nothing to check.
 func (p *Prober) CheckExposure(ctx context.Context) {
+	if p.SkipExposureCheck {
+		for _, np := range neverPublished {
+			p.Clear("exposed_" + strconv.Itoa(np.port))
+		}
+		return
+	}
 	inside := p.insideStack(ctx)
 	for _, np := range neverPublished {
 		code := "exposed_" + strconv.Itoa(np.port)
@@ -171,6 +221,18 @@ func (p *Prober) CheckExposure(ctx context.Context) {
 		_ = conn.Close()
 		p.Warn(code, fmt.Sprintf("Port %d (MediaMTX %s) accepts connections at %s. It must never be published.", np.port, np.what, p.publicHost))
 	}
+}
+
+// SetHTTPClient supplies the authenticated agent transport for remote health checks. Set it before Run.
+func (p *Prober) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		p.client = client
+	}
+}
+
+// SetManagementHealthURL enables an independent health check of the remote management transport.
+func (p *Prober) SetManagementHealthURL(rawURL string) {
+	p.managementHealth = strings.TrimSuffix(rawURL, "/")
 }
 
 // insideStack reports whether PUBLIC_HOST names an address on loopback or the stack's own network. A name that does
@@ -194,9 +256,13 @@ func (p *Prober) insideStack(ctx context.Context) bool {
 }
 
 func (p *Prober) get(ctx context.Context, path string, authorize bool) (int, []byte, error) {
+	return p.getURL(ctx, p.api+path, authorize)
+}
+
+func (p *Prober) getURL(ctx context.Context, target string, authorize bool) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.api+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return 0, nil, err
 	}

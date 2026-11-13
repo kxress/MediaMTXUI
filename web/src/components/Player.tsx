@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 
+import { healthQuery } from '@/api/sidecar'
 import { formatBitrate } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { startWHEP, type WHEPSession } from '@/live/whep'
@@ -39,6 +41,8 @@ export function Player({
   stats?: boolean
   className?: string
 }) {
+  const { data: health } = useQuery(healthQuery)
+  const hlsFallback = health?.hlsFallback ?? false
   const video = useRef<HTMLVideoElement>(null)
   const [mode, setMode] = useState<Mode>('connecting')
   const [note, setNote] = useState<string | null>(null)
@@ -141,9 +145,16 @@ export function Player({
           shortRuns.current = Date.now() - since < shortLived ? shortRuns.current + 1 : 0
           if (shortRuns.current >= 2) {
             shortRuns.current = 0
-            void playHLS(
-              'WebRTC keeps stopping right after it starts (the encoder may be sending B-frames, which WebRTC cannot play), so this plays over HLS, a few seconds behind.',
-            )
+            if (hlsFallback) {
+              void playHLS(
+                'WebRTC keeps stopping right after it starts (the encoder may be sending B-frames, which WebRTC cannot play), so this plays over HLS, a few seconds behind.',
+              )
+            } else {
+              setMode('error')
+              setNote(
+                'WebRTC keeps stopping. HLS fallback is disabled in remote mode so video does not pass through the dashboard host.',
+              )
+            }
           } else {
             setMode('connecting')
             again()
@@ -179,9 +190,16 @@ export function Player({
       } catch (err) {
         whep?.close()
         whep = null
-        await playHLS(
-          `WebRTC did not work (${err instanceof Error ? err.message : 'unknown error'}), so this plays over HLS, a few seconds behind.`,
-        )
+        if (hlsFallback) {
+          await playHLS(
+            `WebRTC did not work (${err instanceof Error ? err.message : 'unknown error'}), so this plays over HLS, a few seconds behind.`,
+          )
+        } else {
+          setMode('error')
+          setNote(
+            `WebRTC did not work (${err instanceof Error ? err.message : 'unknown error'}). HLS fallback is disabled in remote mode so video does not pass through the dashboard host.`,
+          )
+        }
       }
     })()
 
@@ -195,7 +213,7 @@ export function Player({
       v.srcObject = null
       v.removeAttribute('src')
     }
-  }, [path, policy, isPublic, attempt])
+  }, [path, policy, isPublic, attempt, hlsFallback])
 
   const label = { connecting: 'Connecting…', webrtc: 'WebRTC', hls: 'HLS', error: 'Not playing' }[
     mode

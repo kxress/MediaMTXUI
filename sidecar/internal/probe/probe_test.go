@@ -65,8 +65,65 @@ func TestUnreachableIsUnknownNotUnsafe(t *testing.T) {
 	p := New("http://127.0.0.1:1", principal{}, "1.21.1", "mtx.example.com", quiet())
 	p.Check(context.Background())
 	st := p.Status()
-	if st.Reachable || st.APIProtected != nil || st.Unsafe != "" {
+	if st.Reachable || st.APIProtected != nil || st.Unsafe != "" || st.Failure != "media_api_unavailable" {
 		t.Fatalf("status %+v", st)
+	}
+}
+
+func TestRemoteManagementAndMediaFailuresAreDistinct(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/health":
+			_, _ = io.WriteString(w, `{"status":"ok","version":"test","capabilities":["control-api"]}`)
+		case "/v1/media/v3/paths/list":
+			w.WriteHeader(http.StatusBadGateway)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	p := New(server.URL+"/v1/media", principal{}, "1.21.1", "media.example.test", quiet())
+	p.SetHTTPClient(server.Client())
+	p.SetManagementHealthURL(server.URL + "/v1/health")
+	p.Check(context.Background())
+	st := p.Status()
+	if st.ManagementReachable == nil || !*st.ManagementReachable || st.ManagementVersion != "test" || st.Failure != "media_api_unavailable" || st.Reachable {
+		t.Fatalf("agent up / MediaMTX API down = %+v", st)
+	}
+	server.Close()
+	p.Check(context.Background())
+	st = p.Status()
+	if st.ManagementReachable == nil || *st.ManagementReachable || st.Failure != "management_unavailable" || st.Reachable {
+		t.Fatalf("agent down = %+v", st)
+	}
+}
+
+func TestRemoteProbeChecksMediaMTXAuthorizationBehindAuthenticatedAgent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/health":
+			_, _ = io.WriteString(w, `{"status":"ok","version":"test","capabilities":["control-api"]}`)
+		case "/v1/media/v3/paths/list":
+			if _, _, ok := r.BasicAuth(); !ok {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case "/v1/media/v3/info":
+			if _, _, ok := r.BasicAuth(); ok {
+				_, _ = io.WriteString(w, `{"version":"v1.21.3"}`)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	p := New(server.URL+"/v1/media", principal{}, "1.21.3", "media.example.test", quiet())
+	p.SetHTTPClient(server.Client())
+	p.SetManagementHealthURL(server.URL + "/v1/health")
+	p.Check(context.Background())
+	st := p.Status()
+	if st.ManagementReachable == nil || !*st.ManagementReachable || !st.Reachable || st.APIProtected == nil || !*st.APIProtected || st.Version != "1.21.3" {
+		t.Fatalf("remote probe = %+v", st)
 	}
 }
 
@@ -123,6 +180,47 @@ func TestExposure(t *testing.T) {
 		if w := q.Status().Warnings; len(w) != 0 {
 			t.Errorf("%s: warnings %v", host, w)
 		}
+	}
+}
+
+func TestRunDefersExposureUntilMediaMTXAnswers(t *testing.T) {
+	p := New("http://127.0.0.1:1", principal{}, "1.21.1", "mtx.example.com", quiet())
+	p.StackSubnet = netip.MustParsePrefix("172.29.44.0/24")
+	p.lookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("203.0.113.7")}, nil
+	}
+	dials := 0
+	p.dial = func(context.Context, string, string) (net.Conn, error) {
+		dials++
+		return nil, errors.New("refused")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.Run(ctx)
+	if dials != 0 {
+		t.Fatalf("checked exposure %d times before MediaMTX answered", dials)
+	}
+}
+
+func TestRunChecksExposureAfterMediaMTXAnswers(t *testing.T) {
+	srv := fakeMTX(http.StatusUnauthorized, "1.21.1")
+	defer srv.Close()
+	p := New(srv.URL, principal{}, "1.21.1", "mtx.example.com", quiet())
+	p.lookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("203.0.113.7")}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dials := 0
+	p.dial = func(context.Context, string, string) (net.Conn, error) {
+		dials++
+		if dials == 1 {
+			cancel()
+		}
+		return nil, errors.New("refused")
+	}
+	p.Run(ctx)
+	if !p.Status().Reachable || dials != len(neverPublished) {
+		t.Fatalf("reachable=%v exposure checks=%d", p.Status().Reachable, dials)
 	}
 }
 

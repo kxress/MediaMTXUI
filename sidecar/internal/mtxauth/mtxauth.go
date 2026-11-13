@@ -137,6 +137,16 @@ type answer struct {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.serveHTTP(w, r, false)
+}
+
+// ServeRemoteHTTP accepts an authentication callback only after the caller has authenticated a remote agent. It
+// preserves client-address throttling; the remote trust applies solely to the sidecar's own Control API principal.
+func (h *Handler) ServeRemoteHTTP(w http.ResponseWriter, r *http.Request) {
+	h.serveHTTP(w, r, true)
+}
+
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, trustedAgent bool) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -150,7 +160,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Decisions come from memory and the local database; the timeout only guards against a wedged database.
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	d := h.Decide(ctx, req)
+	d := h.decide(ctx, req, trustedAgent)
 	if d.Allow && d.ExpiresAt != nil {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(answer{ExpireAt: d.ExpiresAt.UTC()})
@@ -165,6 +175,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Decide authenticates one request from MediaMTX.
 func (h *Handler) Decide(ctx context.Context, req Request) Decision {
+	return h.decide(ctx, req, false)
+}
+
+// DecideRemote is for a callback authenticated by the configured remote agent.
+func (h *Handler) DecideRemote(ctx context.Context, req Request) Decision {
+	return h.decide(ctx, req, true)
+}
+
+func (h *Handler) decide(ctx context.Context, req Request, trustedAgent bool) Decision {
 	ip, err := netip.ParseAddr(req.IP)
 	if err != nil {
 		return h.deny(req, "", "invalid client address", false)
@@ -184,9 +203,10 @@ func (h *Handler) Decide(ctx context.Context, req Request) Decision {
 		}
 		return Decision{Reason: "anonymous"} // expected before every credentialed RTSP attempt; not logged, not counted
 	}
-	own := h.principal.Own(ip)
+	localOwn := h.principal.Own(ip)
+	principalOwn := localOwn || trustedAgent
 	key := clientip.RateKey(ip)
-	if !own {
+	if !localOwn {
 		if locked, _ := h.throttle.Locked(key); locked {
 			return h.deny(req, req.User, "too many failed attempts from this address", false)
 		}
@@ -195,8 +215,8 @@ func (h *Handler) Decide(ctx context.Context, req Request) Decision {
 	if req.User == SidecarUser {
 		switch {
 		case !h.principal.matches(req.Password):
-			return h.fail(req, key, own, SidecarUser, "wrong sidecar secret")
-		case !own:
+			return h.fail(req, key, localOwn, SidecarUser, "wrong sidecar secret")
+		case !principalOwn:
 			return h.deny(req, SidecarUser, "sidecar principal used from a foreign address", true)
 		case req.Action != "api" && req.Action != "metrics" && req.Action != "playback":
 			return h.deny(req, SidecarUser, "sidecar principal is not for "+req.Action, true)
@@ -207,7 +227,7 @@ func (h *Handler) Decide(ctx context.Context, req Request) Decision {
 	if isViewer(req.User) {
 		reason, uiUser := h.Viewers.check(req.User, req.Password, req.Action, req.Path, ip)
 		if reason != "" {
-			return h.fail(req, key, own, req.User, reason)
+			return h.fail(req, key, localOwn, req.User, reason)
 		}
 		return Decision{Allow: true, Who: "viewer " + uiUser}
 	}
@@ -218,7 +238,7 @@ func (h *Handler) Decide(ctx context.Context, req Request) Decision {
 		return Decision{Reason: "internal error"}
 	}
 	if !found {
-		return h.fail(req, key, own, req.User, "unknown credential or wrong secret")
+		return h.fail(req, key, localOwn, req.User, "unknown credential or wrong secret")
 	}
 	if err := h.creds.Check(c, req.Action, req.Path, ip, h.now()); err != nil {
 		return h.deny(req, c.Name, err.Error(), true)

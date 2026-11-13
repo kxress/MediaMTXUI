@@ -6,17 +6,27 @@ package mtxconf
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/netip"
+	"path"
+	"slices"
+	"strconv"
 	"text/template"
 )
 
 // SeedParams parameterize the config the sidecar writes on first start and at setup.
 type SeedParams struct {
 	MediaMTXVersion string
-	AuthURL         string       // the sidecar's internal /internal/auth
-	PublicHost      string       // offered to WebRTC clients
-	StackSubnet     netip.Prefix // trusted proxies for HLS, WebRTC and playback; omitted when unknown
-	RTSP, RTMP, SRT bool         // ingest protocols; all off until setup chooses
+	AuthURL         string         // the sidecar's internal /internal/auth
+	PublicHost      string         // offered to WebRTC clients
+	WebRTCOrigin    string         // the one browser origin allowed to use MediaMTX's WebRTC HTTP endpoints
+	StackSubnet     netip.Prefix   // trusted proxies for HLS, WebRTC and playback; omitted when unknown
+	TrustedProxies  []netip.Prefix // explicit trusted proxy addresses for a remote MediaMTX instance
+	ControlHost     string         // bind host for private HTTP listeners; empty preserves Docker's all-interface bind
+	MediaHost       string         // bind host for HLS and WebRTC signalling; empty follows ControlHost
+	LogFile         string         // path as seen by MediaMTX
+	RecordingsDir   string         // path as seen by MediaMTX
+	RTSP, RTMP, SRT bool           // ingest protocols; all off until setup chooses
 }
 
 var seedTemplate = template.Must(template.New("seed").Funcs(template.FuncMap{
@@ -27,6 +37,27 @@ var seedTemplate = template.Must(template.New("seed").Funcs(template.FuncMap{
 		}
 		return "no"
 	},
+	"bind": func(host string, port int) string { return net.JoinHostPort(host, strconv.Itoa(port)) },
+	"mediaHost": func(media, control string) string {
+		if media != "" {
+			return media
+		}
+		return control
+	},
+	"proxies": func(stack netip.Prefix, extra []netip.Prefix) []string {
+		out := make([]string, 0, len(extra)+1)
+		if stack.IsValid() {
+			out = append(out, stack.String())
+		}
+		for _, prefix := range extra {
+			if !prefix.IsValid() || slices.Contains(out, prefix.String()) {
+				continue
+			}
+			out = append(out, prefix.String())
+		}
+		return out
+	},
+	"pathJoin": func(root, suffix string) string { return path.Join(root, suffix) },
 }).Parse(`# MediaMTX configuration, managed by the MediaMTX UI sidecar.
 #
 # Change settings in the UI: the sidecar validates every change before MediaMTX sees it. MediaMTX stops when it
@@ -39,7 +70,7 @@ var seedTemplate = template.Must(template.New("seed").Funcs(template.FuncMap{
 
 logLevel: info
 logDestinations: [stdout, file]
-logFile: /logs/mediamtx.log
+logFile: {{q .LogFile}}
 
 ###############################################
 # Authentication: the sidecar decides every request.
@@ -49,16 +80,18 @@ authHTTPAddress: {{q .AuthURL}}
 authHTTPExclude: []
 
 ###############################################
-# Control API, metrics and playback: on the stack network only; these ports are never published.
+# Control API, metrics and playback: use the configured private bind host.
+
+{{- $trusted := proxies .StackSubnet .TrustedProxies}}
 
 api: yes
-apiAddress: :9997
+apiAddress: {{q (bind .ControlHost 9997)}}
 metrics: yes
-metricsAddress: :9998
+metricsAddress: {{q (bind .ControlHost 9998)}}
 playback: yes
-playbackAddress: :9996
-{{- if .StackSubnet.IsValid}}
-playbackTrustedProxies: [{{q .StackSubnet.String}}]
+playbackAddress: {{q (bind .ControlHost 9996)}}
+{{- if $trusted}}
+playbackTrustedProxies: [{{range $i, $p := $trusted}}{{if $i}}, {{end}}{{q $p}}{{end}}]
 {{- end}}
 pprof: no
 
@@ -70,24 +103,29 @@ rtspTransports: [tcp]
 rtmp: {{yesno .RTMP}}
 srt: {{yesno .SRT}}
 
-# HLS and WebRTC signalling reach browsers through the sidecar; WebRTC media uses UDP 8189.
+# MediaMTX serves HLS and WebRTC signalling; WebRTC media uses UDP 8189.
 hls: yes
-{{- if .StackSubnet.IsValid}}
-hlsTrustedProxies: [{{q .StackSubnet.String}}]
+hlsAddress: {{q (bind (mediaHost .MediaHost .ControlHost) 8888)}}
+{{- if $trusted}}
+hlsTrustedProxies: [{{range $i, $p := $trusted}}{{if $i}}, {{end}}{{q $p}}{{end}}]
 {{- end}}
 webrtc: yes
-{{- if .StackSubnet.IsValid}}
-webrtcTrustedProxies: [{{q .StackSubnet.String}}]
+webrtcAddress: {{q (bind (mediaHost .MediaHost .ControlHost) 8889)}}
+{{- if $trusted}}
+webrtcTrustedProxies: [{{range $i, $p := $trusted}}{{if $i}}, {{end}}{{q $p}}{{end}}]
 {{- end}}
 webrtcIPsFromInterfaces: no
 webrtcAdditionalHosts: [{{q .PublicHost}}]
+{{- if .WebRTCOrigin}}
+webrtcAllowOrigins: [{{q .WebRTCOrigin}}]
+{{- end}}
 moq: no
 
 ###############################################
 # Path defaults
 
 pathDefaults:
-  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f_%z
+  recordPath: {{q (pathJoin .RecordingsDir "%path/%Y-%m-%d_%H-%M-%S-%f_%z")}}
   recordDeleteAfter: 168h
 
 ###############################################
@@ -99,6 +137,12 @@ paths:
 
 // Seed renders the sidecar's mediamtx.yml.
 func Seed(p SeedParams) ([]byte, error) {
+	if p.LogFile == "" {
+		p.LogFile = "/logs/mediamtx.log"
+	}
+	if p.RecordingsDir == "" {
+		p.RecordingsDir = "/recordings"
+	}
 	var b bytes.Buffer
 	if err := seedTemplate.Execute(&b, p); err != nil {
 		return nil, err

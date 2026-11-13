@@ -390,7 +390,7 @@ func (s *Server) userDelete(w http.ResponseWriter, r *http.Request) {
 // setup; a wrong code says nothing about which codes or users exist.
 func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if ok, wait := s.setupRate.Allow(clientip.RateKey(clientip.From(ctx).IP)); !ok {
+	if ok, wait := s.joinRate.Allow(clientip.RateKey(clientip.From(ctx).IP)); !ok {
 		writeError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("Too many attempts. Try again in %d seconds.", retryAfter(w, wait)))
 		return
 	}

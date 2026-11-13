@@ -14,6 +14,9 @@ New here? Read [Before you start](before-you-start.md) first: it helps you choos
 | [Install script](install-script.md) | One command from a fresh machine to a running setup page, Docker included |
 | [Install Docker](install-docker.md) | Docker and Docker Compose on Ubuntu, Debian, Raspberry Pi OS and others, from zero |
 | [Install MediaMTX UI](install.md) | The public install with HTTPS from Let's Encrypt, step by step |
+| [Native Linux installation](install-native.md) | Standalone executable and systemd services without Docker |
+| [Move Compose to native](migrate-docker-to-native.md) | Preserve Compose accounts, streams and files in a native installation |
+| [Remote MediaMTX agent](remote-agent.md) | Securely manage MediaMTX on a separate host from the control plane |
 | [Local network only](install-local.md) | A home or studio network that the internet cannot reach |
 | [First steps](first-steps.md) | The setup wizard, your first stream, streaming from OBS, watching |
 
@@ -59,3 +62,4 @@ New here? Read [Before you start](before-you-start.md) first: it helps you choos
 
 Found a mistake, or something missing? Open an issue on
 [GitHub](https://github.com/greatmastix/MediaMTXUI/issues). Security problems: see [SECURITY.md](../SECURITY.md).
+- [Move a Compose installation to native Linux services](migrate-docker-to-native.md)

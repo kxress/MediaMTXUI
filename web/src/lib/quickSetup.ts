@@ -157,15 +157,15 @@ export function credentialAddresses(
 }
 
 /**
- * The WHIP (publish) or WHEP (read) address for WebRTC clients such as OBS, served by the sidecar on the UI's own origin.
- * It carries no secret: the client sends the credential in the Authorization header (Bearer for a token, Basic for a
- * name and secret), which the reverse proxy does not log. Null when MediaMTX's WebRTC server is off.
+ * The WHIP (publish) or WHEP (read) address for WebRTC clients such as OBS. When a public MediaMTX origin is set,
+ * requests go directly to its MediaMTX endpoint; older installs keep using the sidecar routes. Null when WebRTC is off.
  */
 export function rtcAddress(
   origin: string,
   global: Values,
   path: string,
   action: 'read' | 'publish',
+  mediaOrigin?: string,
 ): Address | null {
   if (!enabled(global, 'webrtc')) return null
   const kind = action === 'publish' ? 'whip' : 'whep'
@@ -173,5 +173,6 @@ export function rtcAddress(
     .split('/')
     .map((x) => (x === '<path>' ? x : encodeURIComponent(x)))
     .join('/')
-  return { protocol: kind.toUpperCase(), url: `${origin}/${kind}/${p}` }
+  const url = mediaOrigin ? `${mediaOrigin}/${p}/${kind}` : `${origin}/${kind}/${p}`
+  return { protocol: kind.toUpperCase(), url }
 }

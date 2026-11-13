@@ -74,6 +74,13 @@ func New(ops []mtxapi.Operation, upstream string, principal Authorizer, role fun
 	return p, nil
 }
 
+// SetHTTPClient supplies the authenticated agent transport for a remote Control API. Set it before serving.
+func (p *Proxy) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		p.client = client
+	}
+}
+
 func compile(op mtxapi.Operation, minRole auth.Role) (route, error) {
 	rt := route{op: op, minRole: minRole, query: map[string]bool{}}
 	segs := strings.Split(strings.TrimPrefix(op.Path, "/"), "/")

@@ -38,6 +38,8 @@ type ConfigInfo struct {
 	Locked map[string]string `json:"locked"`
 	// PublicHost is where stream clients connect (MTXUI_PUBLIC_HOST), for the addresses the UI shows.
 	PublicHost string `json:"publicHost"`
+	// PublicMediaURL is the browser-reachable HTTPS origin for MediaMTX's direct WebRTC page and signaling endpoints.
+	PublicMediaURL string `json:"publicMediaURL,omitempty"`
 }
 
 // SnapshotInfo describes one entry of the config history.
@@ -74,7 +76,10 @@ func (s *Server) configGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "Cannot read mediamtx.yml.")
 		return
 	}
-	info := ConfigInfo{Content: string(content), SHA256: sum, Locked: mtxconf.Locked, PublicHost: s.d.Settings.PublicHost}
+	info := ConfigInfo{
+		Content: string(content), SHA256: sum, Locked: s.lockedMTXSettings(), PublicHost: s.d.Settings.PublicHost,
+		PublicMediaURL: s.d.Settings.PublicMediaOrigin(),
+	}
 	if settings, err := yamledit.Decode(content); err == nil {
 		info.Settings = settings
 	}
@@ -263,7 +268,7 @@ func (s *Server) patchSection(w http.ResponseWriter, r *http.Request, section []
 			writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("Edit %s through its own endpoint.", k))
 			return
 		}
-		if why, locked := mtxconf.Locked[k]; section == nil && locked {
+		if why, locked := s.lockedMTXSettings()[k]; section == nil && locked {
 			writeError(w, http.StatusBadRequest, "locked", fmt.Sprintf("%s cannot be changed: %s", k, why))
 			return
 		}
@@ -283,6 +288,18 @@ func (s *Server) patchSection(w http.ResponseWriter, r *http.Request, section []
 		return nil
 	})
 	s.finishWrite(w, r, action, what, map[string]any{"set": keysOf(req.Set), "remove": req.Remove}, snap, err)
+}
+
+// lockedMTXSettings includes deployment-specific invariants for the configured public MediaMTX browser origin.
+func (s *Server) lockedMTXSettings() map[string]string {
+	locked := make(map[string]string, len(mtxconf.Locked)+1)
+	for key, reason := range mtxconf.Locked {
+		locked[key] = reason
+	}
+	if s.d.Settings.MediaMTXAgentURL != nil && s.d.Settings.PublicMediaURL != nil {
+		locked["webrtcAllowOrigins"] = "Only the configured public MediaMTX origin may use its WebRTC HTTP endpoints."
+	}
+	return locked
 }
 
 var settingName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]{0,63}$`)

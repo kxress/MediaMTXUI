@@ -33,6 +33,24 @@ jobs:
           persist-credentials: false
       - run: scripts/ci-run.sh ./dev e2e
 
+  native-build:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Cross-build native Linux artifacts
+        run: >-
+          docker buildx build --platform linux/amd64,linux/arm64 --target native
+          --output type=oci,dest=/tmp/mtxui-native.oci.tar .
+      - name: Run the native binary outside a container as an unprivileged user
+        run: |
+          docker buildx build --platform linux/amd64 --target native --output type=local,dest=/tmp/mtxui-native .
+          bash scripts/native-smoke.sh /tmp/mtxui-native
+
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 20

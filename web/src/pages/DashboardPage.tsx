@@ -28,7 +28,11 @@ export function DashboardPage() {
 
   let mediamtx = 'Checking…'
   if (live.status) {
-    mediamtx = live.status.reachable ? 'Running' : 'Unreachable'
+    mediamtx = live.status.reachable
+      ? 'Running'
+      : st?.managementReachable === false
+        ? 'Management unavailable'
+        : 'Control API unavailable'
   }
   const started = live.info?.started ? Date.parse(live.info.started) : NaN
 

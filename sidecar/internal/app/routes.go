@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -38,6 +40,8 @@ func (s *Server) Public() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.recoverer, bodyDeadline, s.securityHeaders, s.resolver.Middleware, s.requestLog, s.unsafeGate, s.loadSession, s.watchProxy,
 		s.d.Audit.Middleware(actor), s.csrf)
+	s.routes = append(s.routes, Route{http.MethodPost, "/agent/v1/auth", Public, false})
+	r.Post("/agent/v1/auth", s.remoteAgentAuth)
 
 	r.Route("/api", func(api chi.Router) {
 		api.NotFound(func(w http.ResponseWriter, _ *http.Request) {
@@ -183,6 +187,37 @@ func (s *Server) Public() http.Handler {
 	s.routes = append(s.routes, Route{"*", "/*", Public, false})
 	r.Handle("/*", s.d.UI)
 	return r
+}
+
+// remoteAgentAuth accepts only callbacks with a valid per-agent HMAC and one-time nonce. The callback carries client
+// stream credentials, so it is bounded and never logged; mtxauth preserves all the existing authorization rules.
+func (s *Server) remoteAgentAuth(w http.ResponseWriter, r *http.Request) {
+	if s.d.AgentAuthVerifier == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if r.ContentLength > 64<<10 {
+		http.Error(w, "callback too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
+	if err != nil || len(body) > 64<<10 {
+		http.Error(w, "callback too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if !s.d.AgentAuthVerifier.Verify(r, body) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	trusted, ok := s.d.MTXAuth.(interface {
+		ServeRemoteHTTP(http.ResponseWriter, *http.Request)
+	})
+	if !ok {
+		http.Error(w, "remote authorization is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	trusted.ServeRemoteHTTP(w, r)
 }
 
 // handle registers a route under /api with its access level.

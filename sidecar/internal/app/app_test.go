@@ -28,6 +28,7 @@ import (
 	"mtxui/internal/live"
 	"mtxui/internal/liveproxy"
 	"mtxui/internal/logs"
+	"mtxui/internal/mtxagent"
 	"mtxui/internal/mtxapi"
 	"mtxui/internal/mtxauth"
 	"mtxui/internal/mtxconf"
@@ -95,6 +96,10 @@ func newHarness(t *testing.T, env map[string]string, params auth.Params) *harnes
 	if err != nil {
 		t.Fatal(err)
 	}
+	webRTCOrigin := ""
+	if cfg.MediaMTXAgentURL != nil {
+		webRTCOrigin = cfg.PublicMediaOrigin()
+	}
 	dir := t.TempDir()
 	h.dir = dir
 	h.st, err = store.Open(context.Background(), filepath.Join(dir, "db"))
@@ -105,13 +110,16 @@ func newHarness(t *testing.T, env map[string]string, params auth.Params) *harnes
 	_ = os.Mkdir(filepath.Join(dir, "config"), 0o750)
 	writer := &mtxconf.Writer{
 		Path: filepath.Join(dir, "config", "mediamtx.yml"), LockPath: filepath.Join(dir, "lock"),
-		Rules: mtxconf.Rules{AuthURL: cfg.AuthURL()}, Checker: okChecker{}, Store: h.st,
+		Rules: mtxconf.Rules{AuthURL: cfg.AuthURL(), WebRTCOrigin: webRTCOrigin}, Checker: okChecker{}, Store: h.st,
 	}
 	hasher := auth.NewHasher(params, 2)
 	h.setup = &setup.Service{
 		Store: h.st, Hasher: hasher, Writer: writer, TokenPath: filepath.Join(dir, "setup-token"),
 		Seed: func(in setup.Ingest) ([]byte, error) {
-			return mtxconf.Seed(mtxconf.SeedParams{MediaMTXVersion: "1.21.1", AuthURL: cfg.AuthURL(), PublicHost: cfg.PublicHost, RTSP: in.RTSP})
+			return mtxconf.Seed(mtxconf.SeedParams{
+				MediaMTXVersion: "1.21.1", AuthURL: cfg.AuthURL(), PublicHost: cfg.PublicHost,
+				WebRTCOrigin: cfg.PublicMediaOrigin(), RTSP: in.RTSP,
+			})
 		},
 	}
 	if h.token, err = h.setup.EnsureToken(context.Background()); err != nil {
@@ -310,6 +318,94 @@ func TestRouteRegistry(t *testing.T) {
 	}
 }
 
+type remoteAuthRecorder struct{ calls int }
+
+func (h *remoteAuthRecorder) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusUnauthorized)
+}
+
+func (h *remoteAuthRecorder) ServeRemoteHTTP(w http.ResponseWriter, r *http.Request) {
+	h.calls++
+	_, _ = io.Copy(io.Discard, r.Body)
+	w.WriteHeader(http.StatusOK)
+}
+
+func TestRemoteAgentCallbackRequiresSignatureAndRejectsReplay(t *testing.T) {
+	key := bytes.Repeat([]byte{0x71}, 32)
+	env := map[string]string{
+		"MTXUI_MEDIAMTX_AGENT_URL":       "https://agent.example.test:9443",
+		"MTXUI_MEDIAMTX_AGENT_CA":        "/etc/mtxui/agent-ca.pem",
+		"MTXUI_MEDIAMTX_AGENT_CERT":      "/etc/mtxui/client.pem",
+		"MTXUI_MEDIAMTX_AGENT_KEY":       "/etc/mtxui/client-key.pem",
+		"MTXUI_MEDIAMTX_AGENT_AUTH_URL":  "http://127.0.0.1:9081/internal/auth",
+		"MTXUI_REMOTE_AGENT_ID":          "media-east",
+		"MTXUI_REMOTE_AGENT_AUTH_KEY":    strings.Repeat("71", 32),
+		"MTXUI_MEDIAMTX_MEDIA_HOST":      "0.0.0.0",
+		"MTXUI_MEDIAMTX_WEBRTC_URL":      "https://media.example.test",
+		"MTXUI_PUBLIC_MEDIA_URL":         "https://media.example.test",
+		"MTXUI_MEDIAMTX_TRUSTED_PROXIES": "192.0.2.10",
+		"MTXUI_EXPOSURE_CONTROL":         "off",
+	}
+	h := newHarness(t, env, fast)
+	verifier := &mtxagent.Verifier{AgentID: "media-east", Key: key}
+	h.srv.d.AgentAuthVerifier = verifier
+	callback := &remoteAuthRecorder{}
+	h.srv.d.MTXAuth = callback
+	body := []byte(`{"ip":"203.0.113.9","user":"camera","action":"publish","path":"cam1"}`)
+	first := httptest.NewRequest(http.MethodPost, origin+"/agent/v1/auth", bytes.NewReader(body))
+	if err := mtxagent.SignRequest(first, "media-east", key, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	firstRec := httptest.NewRecorder()
+	h.public.ServeHTTP(firstRec, first)
+	if firstRec.Code != http.StatusOK || callback.calls != 1 {
+		t.Fatalf("signed callback = %d, calls %d: %s", firstRec.Code, callback.calls, firstRec.Body.String())
+	}
+	replay := httptest.NewRequest(http.MethodPost, origin+"/agent/v1/auth", bytes.NewReader(body))
+	replay.Header = first.Header.Clone()
+	replayRec := httptest.NewRecorder()
+	h.public.ServeHTTP(replayRec, replay)
+	if replayRec.Code != http.StatusForbidden || callback.calls != 1 {
+		t.Fatalf("replayed callback = %d, calls %d", replayRec.Code, callback.calls)
+	}
+	unsigned := httptest.NewRecorder()
+	h.public.ServeHTTP(unsigned, httptest.NewRequest(http.MethodPost, origin+"/agent/v1/auth", bytes.NewReader(body)))
+	if unsigned.Code != http.StatusForbidden || callback.calls != 1 {
+		t.Fatalf("unsigned callback = %d, calls %d", unsigned.Code, callback.calls)
+	}
+}
+
+func TestRemoteHealthAndHLSDoNotRelayMedia(t *testing.T) {
+	env := map[string]string{
+		"MTXUI_MEDIAMTX_AGENT_URL":       "https://agent.example.test:9443",
+		"MTXUI_MEDIAMTX_AGENT_CA":        "/etc/mtxui/agent-ca.pem",
+		"MTXUI_MEDIAMTX_AGENT_CERT":      "/etc/mtxui/client.pem",
+		"MTXUI_MEDIAMTX_AGENT_KEY":       "/etc/mtxui/client-key.pem",
+		"MTXUI_MEDIAMTX_AGENT_AUTH_URL":  "http://127.0.0.1:9081/internal/auth",
+		"MTXUI_REMOTE_AGENT_ID":          "media-east",
+		"MTXUI_REMOTE_AGENT_AUTH_KEY":    strings.Repeat("a1", 32),
+		"MTXUI_MEDIAMTX_MEDIA_HOST":      "0.0.0.0",
+		"MTXUI_MEDIAMTX_WEBRTC_URL":      "https://media.example.test",
+		"MTXUI_PUBLIC_MEDIA_URL":         "https://media.example.test",
+		"MTXUI_MEDIAMTX_TRUSTED_PROXIES": "192.0.2.10",
+		"MTXUI_EXPOSURE_CONTROL":         "off",
+	}
+	h := newHarness(t, env, fast)
+	health := h.do(http.MethodGet, "/api/v1/health", nil)
+	var got map[string]any
+	if err := json.Unmarshal(health.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["remoteAgent"] != true || got["hlsFallback"] != false || got["recordingFiles"] != false {
+		t.Fatalf("remote health capabilities = %v", got)
+	}
+	w := httptest.NewRecorder()
+	h.srv.watchHLS(w, httptest.NewRequest(http.MethodGet, "/api/v1/live/hls/cam1/index.m3u8", nil))
+	if w.Code != http.StatusNotImplemented || !strings.Contains(w.Body.String(), "video stays between") {
+		t.Fatalf("remote HLS response = %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestSetupFlow(t *testing.T) {
 	h := newHarness(t, nil, fast)
 	if m := decode(h.do("GET", "/api/v1/setup", nil)); m["required"] != true {
@@ -415,6 +511,21 @@ func TestLoginRateLimit(t *testing.T) {
 	// The limit is per client address (behind the trusted proxy, the X-Forwarded-For address).
 	if rec := h.do("POST", "/api/v1/auth/login", map[string]string{"username": "x", "password": "whatever12345"}, header("X-Forwarded-For", "198.51.100.1")); rec.Code != 401 {
 		t.Errorf("another client: %d", rec.Code)
+	}
+}
+
+func TestJoinRateLimit(t *testing.T) {
+	h := newHarness(t, map[string]string{"MTXUI_JOIN_RATE_PER_MINUTE": "1"}, fast) // bursts of 5
+	h.completeSetup()
+	for i := range 5 {
+		rec := h.do("POST", "/api/v1/join", map[string]string{"code": "AAAA-BBBB-CCCC-DDDD", "password": "correct horse battery"})
+		if rec.Code != 401 {
+			t.Fatalf("attempt %d: %d %s", i+1, rec.Code, rec.Body)
+		}
+	}
+	rec := h.do("POST", "/api/v1/join", map[string]string{"code": "AAAA-BBBB-CCCC-DDDD", "password": "correct horse battery"})
+	if rec.Code != 429 || decode(rec)["error"] != "rate_limited" || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("6th attempt: %d %s", rec.Code, rec.Body)
 	}
 }
 

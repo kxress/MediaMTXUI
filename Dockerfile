@@ -24,6 +24,9 @@ COPY sidecar/go.mod sidecar/go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY sidecar/ ./
 COPY --from=web /src/web/dist/ ./internal/webui/dist/
+COPY deploy/native/ /out/native/
+RUN chmod 0644 /out/native/mtxui.service /out/native/mtxui-mediamtx.service /out/native/mtxui-agent.service /out/native/mtxui.env.example /out/native/mtxui-agent.env.example \
+ && chmod 0755 /out/native/mtxui-cli
 ARG VERSION=dev
 ARG MEDIAMTX_VERSION=1.21.3
 ARG TARGETOS TARGETARCH TARGETVARIANT
@@ -38,7 +41,19 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 RUN mkdir -p /out/data/config /out/data/recordings /out/data/logs /out/data/state /out/data/hooks /out/data/portgate /out/data/portgate-status /out/data/backups /out/holding /out/tmp \
  && chmod 700 /out/data/state /out/data/backups && chmod 1777 /out/tmp
 
-FROM scratch
+# Exportable filesystem for native Linux releases. The same tested executable and pinned MediaMTX validator are used
+# by the image and native installations; this target does not require a container runtime on the installed host.
+FROM scratch AS native
+COPY --from=sidecar /out/mtxui /usr/libexec/mtxui/mtxui
+COPY --from=mediamtx /mediamtx /usr/libexec/mtxui/mediamtx
+COPY --from=sidecar /out/native/mtxui.service /usr/lib/systemd/system/mtxui.service
+COPY --from=sidecar /out/native/mtxui-mediamtx.service /usr/lib/systemd/system/mtxui-mediamtx.service
+COPY --from=sidecar /out/native/mtxui-agent.service /usr/lib/systemd/system/mtxui-agent.service
+COPY --from=sidecar /out/native/mtxui.env.example /usr/share/mtxui/mtxui.env.example
+COPY --from=sidecar /out/native/mtxui-agent.env.example /usr/share/mtxui/mtxui-agent.env.example
+COPY --from=sidecar /out/native/mtxui-cli /usr/local/bin/mtxui
+
+FROM scratch AS runtime
 COPY --from=sidecar /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=sidecar /out/mtxui /mtxui
 COPY --from=mediamtx /mediamtx /usr/libexec/mtxui/mediamtx

@@ -61,7 +61,7 @@ test('an invalid edit outside the sidecar is reverted and MediaMTX is back withi
   // MediaMTX ignores file changes within a second of its last reload; the tests before this one just wrote.
   await page.waitForTimeout(1500)
   const broken = await control('config-break')
-  // MediaMTX exits on the invalid reload; the sidecar restores the file within its 2 s check and Docker restarts
+  // MediaMTX exits on the invalid reload; the sidecar restores the file on its 500 ms local check and Docker restarts
   // MediaMTX on it. Back means its API answers the sidecar again.
   await expect
     .poll(

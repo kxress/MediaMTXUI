@@ -14,6 +14,15 @@ export interface PublishTarget {
 
 const enc = encodeURIComponent
 
+function mediaPath(name: string) {
+  return name.split('/').map(enc).join('/')
+}
+
+function rtcURL(stream: Stream, origin: string, kind: 'whip' | 'whep') {
+  const path = mediaPath(stream.name)
+  return stream.mediaURL ? `${stream.mediaURL}/${path}/${kind}` : `${origin}/${kind}/${path}`
+}
+
 function hostPort(host: string, port: number, dflt: number) {
   return port === dflt ? host : `${host}:${String(port)}`
 }
@@ -62,7 +71,7 @@ export function publishTargets(stream: Stream, key: StreamKey, origin: string): 
       protocol: 'WHIP',
       use: 'OBS 30+ (service WHIP): lowest delay to WebRTC viewers.',
       fields: [
-        { label: 'Server', value: `${origin}/whip/${stream.name.split('/').map(enc).join('/')}` },
+        { label: 'Server', value: rtcURL(stream, origin, 'whip') },
         { label: 'Bearer token', value: `${key.name}:${key.secret}`, secret: true },
       ],
     })
@@ -136,7 +145,7 @@ export function playbackTargets(stream: Stream, key: StreamKey, origin: string):
       protocol: 'WHEP',
       use: 'OBS (WHEP source) and other WHEP players: WebRTC, under a second behind. Web pages elsewhere cannot use it; share the watch link.',
       fields: [
-        { label: 'Server', value: `${origin}/whep/${stream.name.split('/').map(enc).join('/')}` },
+        { label: 'Server', value: rtcURL(stream, origin, 'whep') },
         { label: 'Bearer token', value: `${key.name}:${key.secret}`, secret: true },
       ],
     })
@@ -146,7 +155,8 @@ export function playbackTargets(stream: Stream, key: StreamKey, origin: string):
 
 /** The watch link: a page anyone can open in a browser (public streams only). */
 export function watchLink(stream: Stream, origin: string): string {
-  return `${origin}/s/${stream.name.split('/').map(enc).join('/')}`
+  const path = mediaPath(stream.name)
+  return stream.mediaURL ? `${stream.mediaURL}/${path}` : `${origin}/s/${path}`
 }
 
 /** Keyless addresses of a public stream for players and servers. */
@@ -180,9 +190,7 @@ export function publicTargets(stream: Stream, origin: string): PublishTarget[] {
     out.push({
       protocol: 'WHEP',
       use: 'OBS (WHEP source) and other WHEP players: WebRTC, under a second behind. Web pages elsewhere cannot use it; share the watch link.',
-      fields: [
-        { label: 'Server', value: `${origin}/whep/${stream.name.split('/').map(enc).join('/')}` },
-      ],
+      fields: [{ label: 'Server', value: rtcURL(stream, origin, 'whep') }],
     })
   }
   return out

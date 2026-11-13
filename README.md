@@ -39,6 +39,10 @@ page and point OBS (or ffmpeg, a camera) at the address and key it shows.
 That's it. To upgrade later, run the same command again. What the installer does, its options, and how to read it
 before running it: [Install script](docs/install-script.md).
 
+**Prefer not to install Docker?** See [Native Linux installation](docs/install-native.md) for a standalone executable
+and systemd services. Native installs can manage MediaMTX locally or use the [remote agent](docs/remote-agent.md) to
+manage a separate media host without shared filesystems or public Control API access.
+
 > [!TIP]
 > **New to servers?** The [documentation](docs/README.md) starts from zero: [choosing a
 > server](docs/before-you-start.md), [opening a terminal on it](docs/install-docker.md#open-a-terminal-on-the-server),

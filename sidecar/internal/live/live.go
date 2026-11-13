@@ -187,6 +187,13 @@ func New(api string, principal Authorizer, ops []mtxapi.Operation, log *slog.Log
 	return h, nil
 }
 
+// SetHTTPClient supplies the authenticated agent transport for a remote Control API. Set it before Run.
+func (h *Hub) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		h.client = client
+	}
+}
+
 // Run polls until ctx ends, then closes every subscription.
 func (h *Hub) Run(ctx context.Context) {
 	defer h.closeAll()

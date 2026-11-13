@@ -29,10 +29,19 @@ type Health struct {
 	Status          string `json:"status"`
 	Version         string `json:"version"`
 	MediaMTXVersion string `json:"mediamtxVersion"`
+	RemoteAgent     bool   `json:"remoteAgent"`
+	HLSFallback     bool   `json:"hlsFallback"`
+	RecordingFiles  bool   `json:"recordingFiles"`
+	MediaLogs       bool   `json:"mediaLogs"`
+	HoldingUpload   bool   `json:"holdingUpload"`
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, Health{Status: "ok", Version: buildinfo.Version, MediaMTXVersion: buildinfo.MediaMTXVersion})
+	remote := s.d.Settings.MediaMTXAgentURL != nil
+	writeJSON(w, http.StatusOK, Health{
+		Status: "ok", Version: buildinfo.Version, MediaMTXVersion: buildinfo.MediaMTXVersion,
+		RemoteAgent: remote, HLSFallback: !remote, RecordingFiles: !remote, MediaLogs: !remote, HoldingUpload: !remote,
+	})
 }
 
 // param is a route parameter, unescaped. chi matches on the escaped path when the request's has escapes Go would not

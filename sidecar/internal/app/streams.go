@@ -148,10 +148,11 @@ type StreamInfo struct {
 	CanManage  bool                      `json:"canManage"`
 	CanAdmin   bool                      `json:"canAdmin"`
 	Ingest     Ingest                    `json:"ingest"`
-	Audio      string                    `json:"audio"`   // what the encoder sends: aac or opus
-	Holding    string                    `json:"holding"` // "", builtin or file
-	Clips      StreamClips               `json:"clips"`   // the own holding clip's versions
-	Format     string                    `json:"format"`  // the stream's video format, which holding clips are in
+	MediaURL   string                    `json:"mediaURL,omitempty"` // public MediaMTX origin for the built-in page and direct WHIP/WHEP
+	Audio      string                    `json:"audio"`              // what the encoder sends: aac or opus
+	Holding    string                    `json:"holding"`            // "", builtin or file
+	Clips      StreamClips               `json:"clips"`              // the own holding clip's versions
+	Format     string                    `json:"format"`             // the stream's video format, which holding clips are in
 	// HoldingMaxBytes is the largest holding clip an upload may be (MTXUI_HOLDING_MAX_GB), for those who manage it.
 	HoldingMaxBytes int64 `json:"holdingMaxBytes,omitempty"`
 }
@@ -235,7 +236,7 @@ func (s *Server) streamInfo(ctx context.Context, st store.Stream, cur *currentSe
 		ID: st.ID, Name: st.Name, Title: st.Title, Target: st.Target, Public: st.Public, CreatedBy: st.CreatedBy,
 		CreatedAt: st.CreatedAt.UTC().Format(timeFormat), Keys: map[string]*StreamKeyInfo{},
 		CanManage: s.mayManage(cur, st), CanAdmin: auth.Role(cur.user.Role).AtLeast(auth.RoleAdmin),
-		Ingest: cfg.ingest(s.d.Settings.PublicHost), Audio: st.Audio, Holding: st.Holding,
+		Ingest: cfg.ingest(s.d.Settings.PublicHost), MediaURL: s.d.Settings.PublicMediaOrigin(), Audio: st.Audio, Holding: st.Holding,
 		Clips:  StreamClips{AAC: st.ClipAAC != "", Opus: st.ClipOpus != ""},
 		Format: st.Format,
 	}
@@ -841,6 +842,10 @@ func (s *Server) publicStreamGet(w http.ResponseWriter, r *http.Request) {
 
 // publicHLS proxies a public stream's HLS for anyone (the watch link's fallback when WebRTC does not connect).
 func (s *Server) publicHLS(w http.ResponseWriter, r *http.Request) {
+	if s.d.Settings.MediaMTXAgentURL != nil {
+		writeError(w, http.StatusNotImplemented, "remote_media", "HLS fallback is disabled in remote mode so video stays between the browser and MediaMTX. Use WebRTC or connect directly to the media endpoint.")
+		return
+	}
 	path, file, err := liveproxy.SplitHLS(param(r, "*"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid", "Invalid path or file.")

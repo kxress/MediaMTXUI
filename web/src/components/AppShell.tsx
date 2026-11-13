@@ -448,7 +448,7 @@ function DriftActions() {
   )
 }
 
-/** Problems that concern every page: the sidecar's own warnings, and MediaMTX not answering. */
+/** Problems that concern every page: the dashboard's own warnings and its media-management connection. */
 function Banners() {
   const { data: session } = useQuery(sessionQuery)
   // A streamer's status comes from its scoped event stream only; the sidecar's status is for viewers and up.
@@ -469,11 +469,19 @@ function Banners() {
       )}
       {status && !status.reachable && (
         <Alert variant="destructive" role="alert" data-testid="mediamtx-unreachable">
-          <AlertTitle>MediaMTX is not answering</AlertTitle>
+          <AlertTitle>
+            {st?.managementReachable === false
+              ? 'MediaMTX management connection is unavailable'
+              : 'MediaMTX Control API is not answering'}
+          </AlertTitle>
           <AlertDescription>
-            {status.error ? `${status.error}. ` : ''}
+            {st?.managementReachable === false
+              ? 'The remote agent cannot be reached, so the media server state is unknown. Existing media sessions may continue.'
+              : status.error
+                ? `${status.error}. `
+                : 'The management connection can reach its agent, but not the MediaMTX Control API.'}{' '}
             For {formatDuration((now - Date.parse(status.since)) / 1000)} now. The pages show the
-            last known state and catch up by themselves once MediaMTX is back.
+            last known state and catch up by themselves when management is available again.
           </AlertDescription>
         </Alert>
       )}

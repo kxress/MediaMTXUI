@@ -90,6 +90,26 @@ describe('stream addresses', () => {
     ])
   })
 
+  it('uses the public MediaMTX origin for shared pages and direct WHIP/WHEP when configured', () => {
+    const remote = { ...stream('live/alice'), mediaURL: 'https://media.example.test' }
+    expect(watchLink(remote, 'https://ui.vpn.example')).toBe(
+      'https://media.example.test/live/alice',
+    )
+    expect(
+      publishTargets(remote, key, 'https://ui.vpn.example').find((x) => x.protocol === 'WHIP')
+        ?.fields[0]?.value,
+    ).toBe('https://media.example.test/live/alice/whip')
+    const reader = { kind: 'playback' as const, name: 'view-x', secret: 'r3ad' }
+    expect(
+      playbackTargets(remote, reader, 'https://ui.vpn.example').find((x) => x.protocol === 'WHEP')
+        ?.fields[0]?.value,
+    ).toBe('https://media.example.test/live/alice/whep')
+    expect(
+      publicTargets(remote, 'https://ui.vpn.example').find((x) => x.protocol === 'WHEP')?.fields[0]
+        ?.value,
+    ).toBe('https://media.example.test/live/alice/whep')
+  })
+
   it('masks secrets', () => {
     expect(mask('a?pass=s3cr3t', 's3cr3t')).toBe('a?pass=••••••••••••')
   })

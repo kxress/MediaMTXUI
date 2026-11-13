@@ -144,7 +144,16 @@ export function fakeSidecar(initial: Partial<FakeState> = {}, extra: Record<stri
   }
   const routes: Record<string, Route> = {
     'GET /api/v1/health': () =>
-      json(200, { status: 'ok', version: '0.1.0', mediamtxVersion: '1.21.1' }),
+      json(200, {
+        status: 'ok',
+        version: '0.1.0',
+        mediamtxVersion: '1.21.1',
+        remoteAgent: false,
+        hlsFallback: true,
+        recordingFiles: true,
+        mediaLogs: true,
+        holdingUpload: true,
+      }),
     'GET /api/v1/setup': () => json(200, { required: state.setupRequired }),
     'POST /api/v1/setup': (body) => {
       if (!state.setupRequired) return error(404, 'not_found', 'Setup has already been completed.')

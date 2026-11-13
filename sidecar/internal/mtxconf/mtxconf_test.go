@@ -56,6 +56,42 @@ func TestSeed(t *testing.T) {
 		t.Errorf("the seed breaks the sidecar's own rules: %v", err)
 	}
 
+	direct := params
+	direct.WebRTCOrigin = "https://media.example.test"
+	directConfig := seed(t, direct)
+	if err := (Rules{AuthURL: authURL, WebRTCOrigin: direct.WebRTCOrigin}).Check(directConfig); err != nil {
+		t.Errorf("the direct-media seed breaks its origin rule: %v", err)
+	}
+	unsafeOrigin := strings.Replace(string(directConfig), `webrtcAllowOrigins: ["https://media.example.test"]`, `webrtcAllowOrigins: ["*"]`, 1)
+	if err := (Rules{AuthURL: authURL, WebRTCOrigin: direct.WebRTCOrigin}).Check([]byte(unsafeOrigin)); err == nil || !strings.Contains(err.Error(), "webrtcAllowOrigins must contain only") {
+		t.Errorf("a wildcard WebRTC origin passed remote rules: %v", err)
+	}
+
+	native := params
+	native.ControlHost = "127.0.0.1"
+	native.LogFile = "/var/lib/mtxui/logs/mediamtx.log"
+	native.RecordingsDir = "/var/lib/mtxui/recordings"
+	local := seed(t, native)
+	var localConf map[string]any
+	if err := yaml.Unmarshal(local, &localConf); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"apiAddress": "127.0.0.1:9997", "metricsAddress": "127.0.0.1:9998",
+		"playbackAddress": "127.0.0.1:9996", "hlsAddress": "127.0.0.1:8888",
+		"webrtcAddress": "127.0.0.1:8889", "logFile": native.LogFile,
+	} {
+		if got := localConf[key]; got != want {
+			t.Errorf("native %s = %v, want %q", key, got, want)
+		}
+	}
+	if err := (Rules{AuthURL: authURL, RecordingsDir: native.RecordingsDir, PrivateControl: true}).Check(local); err != nil {
+		t.Errorf("native seed breaks local paths: %v", err)
+	}
+	if err := (Rules{AuthURL: authURL, RecordingsDir: native.RecordingsDir}).Check(b); err == nil || !strings.Contains(err.Error(), "under /var/lib/mtxui/recordings/") {
+		t.Errorf("a config with Docker recording paths was accepted for a native instance: %v", err)
+	}
+
 	noSubnet := params
 	noSubnet.StackSubnet = netip.Prefix{}
 	if b := seed(t, noSubnet); strings.Contains(string(b), "TrustedProxies") {
@@ -90,12 +126,12 @@ func TestRules(t *testing.T) {
 		{"API off", replace("api: yes", "api: no"), "api must be on"},
 		{"pprof on", replace("pprof: no", "pprof: yes"), "pprof must be off"},
 		{"RTMP on the RTSP port", replace("rtmp: no", "rtmp: yes\nrtmpAddress: :8554"), "both listen on tcp port 8554"},
-		{"API on the HLS port", replace("apiAddress: :9997", "apiAddress: :8888"), "both listen on tcp port 8888"},
+		{"API on the HLS port", replace(`apiAddress: ":9997"`, `apiAddress: ":8888"`), "both listen on tcp port 8888"},
 		{"SRT on WebRTC's UDP port", replace("srt: no", "srt: yes\nsrtAddress: :8189"), "both listen on udp port 8189"},
 		{"RTSP over UDP on the SRT port", []byte(strings.NewReplacer("rtspTransports: [tcp]", "rtspTransports: [udp, tcp]\nrtpAddress: :8890",
 			"srt: no", "srt: yes").Replace(good)), "both listen on udp port 8890"},
-		{"metrics on the RTMP port", replace("metricsAddress: :9998", "metricsAddress: :1935"), "metricsAddress must not use port 1935"},
-		{"playback on the SRT port", replace("playbackAddress: :9996", "playbackAddress: 0.0.0.0:8890"), "playbackAddress must not use port 8890"},
+		{"metrics on the RTMP port", replace(`metricsAddress: ":9998"`, `metricsAddress: ":1935"`), "metricsAddress must not use port 1935"},
+		{"playback on the SRT port", replace(`playbackAddress: ":9996"`, `playbackAddress: "0.0.0.0:8890"`), "playbackAddress must not use port 8890"},
 		{"record outside /recordings", replace("/recordings/%path/", "/etc/%path/"), "under /recordings/"},
 		{"record with ..", replace("/recordings/%path/", "/recordings/../%path/"), `must not contain ".."`},
 		{"record without %path", replace("/recordings/%path/%Y", "/recordings/all/%Y"), "must contain %path"},
@@ -111,15 +147,32 @@ func TestRules(t *testing.T) {
 	}
 	for name, content := range map[string][]byte{
 		"TCP and UDP on one port": replace("srt: no", "srt: yes\nsrtAddress: :8888"),
-		"one port on two hosts": []byte(strings.NewReplacer("apiAddress: :9997", "apiAddress: 127.0.0.1:8000",
-			"metricsAddress: :9998", "metricsAddress: 10.0.0.1:8000").Replace(good)),
-		"disabled server's default": replace("hls: yes", "hls: yes\nhlsAddress: :1936"), // RTMPS's, which is off
+		"one port on two hosts": []byte(strings.NewReplacer(`apiAddress: ":9997"`, `apiAddress: "127.0.0.1:8000"`,
+			`metricsAddress: ":9998"`, `metricsAddress: "10.0.0.1:8000"`).Replace(good)),
+		"disabled server's default": replace(`hlsAddress: ":8888"`, `hlsAddress: ":1936"`), // RTMPS's, which is off
 		"regex path":                with("  ~^cam[0-9]+$:\n"),
 		"booleans as true/false":    replace("api: yes", "api: true"),
 	} {
 		if err := r.Check(content); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+func TestPrivateControlListeners(t *testing.T) {
+	rules := Rules{AuthURL: authURL, PrivateControl: true}
+	native := params
+	native.ControlHost = "127.0.0.1"
+	if err := rules.Check(seed(t, native)); err != nil {
+		t.Fatalf("native loopback listeners rejected: %v", err)
+	}
+	if err := rules.Check(seed(t, params)); err == nil || !strings.Contains(err.Error(), "apiAddress must bind to a loopback IP address") {
+		t.Fatalf("Docker-style wildcard Control API accepted: %v", err)
+	}
+	unsafe := seed(t, native)
+	unsafe = []byte(strings.Replace(string(unsafe), `metricsAddress: "127.0.0.1:9998"`, `metricsAddress: ":9998"`, 1))
+	if err := rules.Check(unsafe); err == nil || !strings.Contains(err.Error(), "metricsAddress must bind to a loopback IP address") {
+		t.Fatalf("wildcard metrics listener accepted: %v", err)
 	}
 }
 

@@ -23,7 +23,7 @@ func TestDefaults(t *testing.T) {
 	if s.Origin() != "https://mtx.example.com" || !s.Secure() {
 		t.Errorf("origin %q secure %v", s.Origin(), s.Secure())
 	}
-	if s.Listen != ":9080" || s.InternalListen != ":9081" || s.DataDir != "/data" || s.MediaMTXHost != "mediamtx" {
+	if s.DeploymentMode != "docker" || s.Listen != ":9080" || s.InternalListen != ":9081" || s.DataDir != "/data" || s.MediaMTXHost != "mediamtx" {
 		t.Errorf("unexpected defaults: %+v", s)
 	}
 	if s.AuthURL() != "http://sidecar:9081/internal/auth" {
@@ -35,7 +35,10 @@ func TestDefaults(t *testing.T) {
 	if s.ConfigFile() != "/data/config/mediamtx.yml" || s.DBPath() != "/data/state/mtxui.db" {
 		t.Errorf("paths: %s %s", s.ConfigFile(), s.DBPath())
 	}
-	if s.SessionIdleTimeout != 12*time.Hour || s.SessionMaxAge != 168*time.Hour || s.LockoutThreshold != 5 {
+	if s.MediaMTXLog() != "/data/logs/mediamtx.log" || s.RecordingDataDir() != "/data/recordings" {
+		t.Errorf("Docker local data paths changed: log=%s recordings=%s", s.MediaMTXLog(), s.RecordingDataDir())
+	}
+	if s.SessionIdleTimeout != 12*time.Hour || s.SessionMaxAge != 168*time.Hour || s.JoinRatePerMinute != 10 || s.LockoutThreshold != 5 {
 		t.Errorf("auth defaults: %+v", s)
 	}
 	if s.StackSubnet.IsValid() || len(s.TrustedProxies) != 0 {
@@ -43,6 +46,131 @@ func TestDefaults(t *testing.T) {
 	}
 	if gb := 3.9; s.HoldingMaxBytes != int64(gb*(1<<30)) || s.HoldingMaxBytes >= 1<<32 {
 		t.Errorf("holding clip limit %d: under 4 GiB, which MediaMTX's MP4 reader cannot go past", s.HoldingMaxBytes)
+	}
+}
+
+func TestNativeLocalSettings(t *testing.T) {
+	s, err := Load(env(map[string]string{
+		"MTXUI_DEPLOYMENT_MODE":         "native",
+		"MTXUI_PUBLIC_URL":              "http://127.0.0.1:9080",
+		"MTXUI_PUBLIC_HOST":             "127.0.0.1",
+		"MTXUI_LISTEN":                  "127.0.0.1:9080",
+		"MTXUI_INTERNAL_LISTEN":         "127.0.0.1:9081",
+		"MTXUI_INTERNAL_URL":            "http://127.0.0.1:9081",
+		"MTXUI_MEDIAMTX_HOST":           "127.0.0.1",
+		"MTXUI_MEDIAMTX_CONTROL_HOST":   "127.0.0.1",
+		"MTXUI_DATA_DIR":                "/var/lib/mtxui",
+		"MTXUI_HOLDING_DIR":             "/var/lib/mtxui/holding",
+		"MTXUI_MEDIAMTX_LOG_PATH":       "/var/lib/mtxui/logs/mediamtx.log",
+		"MTXUI_MEDIAMTX_LOG_DATA_PATH":  "/var/lib/mtxui/logs/mediamtx.log",
+		"MTXUI_MEDIAMTX_RECORDINGS_DIR": "/var/lib/mtxui/recordings",
+		"MTXUI_RECORDINGS_DATA_DIR":     "/var/lib/mtxui/recordings",
+		"MTXUI_PASSKEYS":                "off",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.MediaMTXControlHost != "127.0.0.1" || s.MediaMTXRecordingsDir != "/var/lib/mtxui/recordings" ||
+		s.MediaMTXLogFile != "/var/lib/mtxui/logs/mediamtx.log" ||
+		s.RecordingsDataDir != "/var/lib/mtxui/recordings" {
+		t.Fatalf("native local settings not retained: %+v", s)
+	}
+	if s.DeploymentMode != "native" {
+		t.Fatalf("native runtime mode = %q", s.DeploymentMode)
+	}
+	if got := s.MediaMTXLog(); got != "/var/lib/mtxui/logs/mediamtx.log" {
+		t.Fatalf("application log path = %q", got)
+	}
+	if got := s.RecordingDataDir(); got != "/var/lib/mtxui/recordings" {
+		t.Fatalf("application recordings path = %q", got)
+	}
+	bad := map[string]string{
+		"MTXUI_DEPLOYMENT_MODE": "native", "MTXUI_PUBLIC_URL": "http://127.0.0.1:9080",
+		"MTXUI_PUBLIC_HOST": "127.0.0.1",
+	}
+	if _, err := Load(env(bad)); err == nil || !strings.Contains(err.Error(), "MTXUI_MEDIAMTX_CONTROL_HOST must be a loopback IP address in native mode") {
+		t.Fatalf("native mode without a private Control API bind accepted: %v", err)
+	}
+}
+
+func TestRemoteAgentSettings(t *testing.T) {
+	kv := minimal()
+	kv["MTXUI_MEDIAMTX_AGENT_URL"] = "https://media-agent.example.test:9443"
+	kv["MTXUI_MEDIAMTX_AGENT_CA"] = "/etc/mtxui/agent-ca.pem"
+	kv["MTXUI_MEDIAMTX_AGENT_CERT"] = "/etc/mtxui/agent-client.pem"
+	kv["MTXUI_MEDIAMTX_AGENT_KEY"] = "/etc/mtxui/agent-client-key.pem"
+	kv["MTXUI_MEDIAMTX_AGENT_AUTH_URL"] = "http://127.0.0.1:9081/internal/auth"
+	kv["MTXUI_REMOTE_AGENT_ID"] = "media-east"
+	kv["MTXUI_REMOTE_AGENT_AUTH_KEY"] = strings.Repeat("a7", 32)
+	kv["MTXUI_MEDIAMTX_MEDIA_HOST"] = "0.0.0.0"
+	kv["MTXUI_MEDIAMTX_WEBRTC_URL"] = "https://media.example.test"
+	kv["MTXUI_PUBLIC_MEDIA_URL"] = "https://media.example.test"
+	kv["MTXUI_MEDIAMTX_TRUSTED_PROXIES"] = "192.0.2.10"
+	s, err := Load(env(kv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.MediaMTXAPIURL(); got != "https://media-agent.example.test:9443/v1/media" {
+		t.Fatalf("agent API URL = %q", got)
+	}
+	if got := s.MediaMTXAuthURL(); got != kv["MTXUI_MEDIAMTX_AGENT_AUTH_URL"] {
+		t.Fatalf("agent auth URL = %q", got)
+	}
+	if s.MediaMTXControlHost != "" {
+		t.Fatalf("unspecified control host should be locked to loopback by remote config seed: %q", s.MediaMTXControlHost)
+	}
+	if got := s.MediaMTXWebRTCBaseURL(); got != "https://media.example.test" {
+		t.Fatalf("remote WebRTC signalling URL = %q", got)
+	}
+	if got := s.PublicMediaOrigin(); got != "https://media.example.test" {
+		t.Fatalf("public media origin = %q", got)
+	}
+
+	bad := mapsClone(kv)
+	delete(bad, "MTXUI_MEDIAMTX_AGENT_KEY")
+	if _, err := Load(env(bad)); err == nil || !strings.Contains(err.Error(), "MTXUI_MEDIAMTX_AGENT_CA, MTXUI_MEDIAMTX_AGENT_CERT, MTXUI_MEDIAMTX_AGENT_KEY") {
+		t.Fatalf("missing mTLS key accepted: %v", err)
+	}
+	bad = mapsClone(kv)
+	bad["MTXUI_MEDIAMTX_AGENT_URL"] = "http://media-agent.example.test:9443"
+	if _, err := Load(env(bad)); err == nil || !strings.Contains(err.Error(), "must be an https:// origin") {
+		t.Fatalf("plain HTTP agent URL accepted: %v", err)
+	}
+	bad = mapsClone(kv)
+	bad["MTXUI_MEDIAMTX_WEBRTC_URL"] = "http://media.example.test"
+	if _, err := Load(env(bad)); err == nil || !strings.Contains(err.Error(), "MTXUI_MEDIAMTX_WEBRTC_URL") {
+		t.Fatalf("plain HTTP WebRTC signalling URL accepted for remote mode: %v", err)
+	}
+	bad = mapsClone(kv)
+	delete(bad, "MTXUI_PUBLIC_MEDIA_URL")
+	if _, err := Load(env(bad)); err == nil || !strings.Contains(err.Error(), "MTXUI_PUBLIC_MEDIA_URL") {
+		t.Fatalf("remote mode without a public media origin accepted: %v", err)
+	}
+	bad = mapsClone(kv)
+	bad["MTXUI_PUBLIC_MEDIA_URL"] = "http://media.example.test"
+	if _, err := Load(env(bad)); err == nil || !strings.Contains(err.Error(), "MTXUI_PUBLIC_MEDIA_URL") {
+		t.Fatalf("plain HTTP public media origin accepted: %v", err)
+	}
+	bad = mapsClone(kv)
+	bad["MTXUI_REMOTE_AGENT_ID"] = "bad\nagent"
+	if _, err := Load(env(bad)); err == nil || !strings.Contains(err.Error(), "MTXUI_REMOTE_AGENT_ID") {
+		t.Fatalf("invalid remote agent identity accepted: %v", err)
+	}
+}
+
+func mapsClone(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func TestRecordingsRootCannotBeFilesystemRoot(t *testing.T) {
+	kv := minimal()
+	kv["MTXUI_MEDIAMTX_RECORDINGS_DIR"] = "/"
+	if _, err := Load(env(kv)); err == nil || !strings.Contains(err.Error(), "MTXUI_MEDIAMTX_RECORDINGS_DIR must not be the filesystem root") {
+		t.Fatalf("filesystem root recordings directory: %v", err)
 	}
 }
 
@@ -101,6 +229,7 @@ func TestRejects(t *testing.T) {
 		{"idle timeout", "MTXUI_SESSION_IDLE_TIMEOUT", "1m", "between"},
 		{"max age below idle", "MTXUI_SESSION_MAX_AGE", "6h", "at least"},
 		{"rate", "MTXUI_LOGIN_RATE_PER_MINUTE", "0", "between 1 and 600"},
+		{"join rate", "MTXUI_JOIN_RATE_PER_MINUTE", "0", "between 1 and 600"},
 		{"threshold", "MTXUI_LOCKOUT_THRESHOLD", "many", "whole number"},
 		{"holding clips past 4 GiB", "MTXUI_HOLDING_MAX_GB", "4", "from 0.01 to 3.9"},
 		{"holding clips of nothing", "MTXUI_HOLDING_MAX_GB", "0", "from 0.01 to 3.9"},

@@ -1,0 +1,33 @@
+[Unit]
+Description=MediaMTX media server managed by MediaMTX UI
+Documentation=https://github.com/bluenviron/mediamtx
+Requires=mtxui.service
+After=network-online.target mtxui.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mtxui
+Group=mtxui
+UMask=0027
+EnvironmentFile=/etc/mtxui/mtxui.env
+ExecStart=/bin/sh -c 'exec /usr/libexec/mtxui/mediamtx "$${MTXUI_DATA_DIR:-/var/lib/mtxui}/config/mediamtx.yml"'
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

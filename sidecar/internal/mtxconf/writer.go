@@ -23,6 +23,14 @@ type Checker interface {
 	Validate(ctx context.Context, content []byte) error
 }
 
+// RemoteConfig is the minimal fixed-file protocol used by the optional remote MediaMTX agent.
+// Implementations expose one configured MediaMTX YAML file, validation and compare-and-swap writes only.
+type RemoteConfig interface {
+	Read(ctx context.Context) ([]byte, string, error)
+	Validate(ctx context.Context, content []byte) error
+	Apply(ctx context.Context, content []byte, expectSHA string) error
+}
+
 // Writer is the only code that writes mediamtx.yml.
 type Writer struct {
 	Path     string // mediamtx.yml; its directory is what MediaMTX mounts
@@ -36,6 +44,8 @@ type Writer struct {
 	// (verified with v1.21.1), so a second write in quick succession would never be applied. ReloadGap is the value
 	// for a running stack; zero (tests without MediaMTX) writes at once.
 	MinGap time.Duration
+	// Remote, when set, mirrors the same managed config operations through a narrowly scoped remote agent.
+	Remote RemoteConfig
 
 	mu        sync.Mutex
 	last      string    // SHA-256 of the file as last written or reconciled
@@ -64,6 +74,12 @@ func (w *Writer) Validate(ctx context.Context, content []byte) error {
 	if err := w.Rules.Check(content); err != nil {
 		return &InvalidError{Err: err}
 	}
+	if w.Remote != nil {
+		if err := w.Remote.Validate(ctx, content); err != nil {
+			return &InvalidError{Err: err}
+		}
+		return nil
+	}
 	return w.Checker.Validate(ctx, content)
 }
 
@@ -81,6 +97,13 @@ func (w *Writer) Write(ctx context.Context, content []byte, author, reason strin
 func (w *Writer) writeLocked(ctx context.Context, content []byte, author, reason string) (store.Snapshot, error) {
 	if err := w.Validate(ctx, content); err != nil {
 		return store.Snapshot{}, err
+	}
+	if w.Remote != nil {
+		before, sum, err := w.Remote.Read(ctx)
+		if err != nil {
+			return store.Snapshot{}, err
+		}
+		return w.writeRemoteLocked(ctx, before, sum, content, author, reason)
 	}
 	w.mu.Lock()
 	wait := w.MinGap - time.Since(w.lastWrite)
@@ -105,8 +128,71 @@ func (w *Writer) writeLocked(ctx context.Context, content []byte, author, reason
 	return snap, err
 }
 
+func (w *Writer) writeRemoteLocked(ctx context.Context, before []byte, expectSHA string, content []byte, author, reason string) (store.Snapshot, error) {
+	if err := w.Validate(ctx, content); err != nil {
+		return store.Snapshot{}, err
+	}
+	w.mu.Lock()
+	wait := w.MinGap - time.Since(w.lastWrite)
+	w.mu.Unlock()
+	if wait > 0 {
+		select {
+		case <-ctx.Done():
+			return store.Snapshot{}, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	if err := w.Remote.Apply(ctx, content, expectSHA); err != nil {
+		return store.Snapshot{}, err
+	}
+	if err := writeAtomic(w.Path, content); err != nil {
+		rollbackErr := w.Remote.Apply(context.WithoutCancel(ctx), before, sha(content))
+		if rollbackErr != nil {
+			return store.Snapshot{}, fmt.Errorf("remote config applied but local mirror failed: %w (remote rollback failed: %w)", err, rollbackErr)
+		}
+		return store.Snapshot{}, err
+	}
+	w.mu.Lock()
+	w.lastWrite = time.Now()
+	w.mu.Unlock()
+	snap, err := w.Store.InsertSnapshot(ctx, content, author, reason)
+	if err != nil {
+		rollbackErr := w.Remote.Apply(context.WithoutCancel(ctx), before, sha(content))
+		if rollbackErr == nil {
+			_ = writeAtomic(w.Path, before)
+		} else {
+			return store.Snapshot{}, fmt.Errorf("remote config applied but recording its history failed: %w (remote rollback failed: %w)", err, rollbackErr)
+		}
+		return store.Snapshot{}, err
+	}
+	w.remember(snap.SHA256)
+	return snap, nil
+}
+
+func (w *Writer) current(ctx context.Context) ([]byte, error) {
+	if w.Remote != nil {
+		content, _, err := w.Remote.Read(ctx)
+		return content, err
+	}
+	return os.ReadFile(w.Path)
+}
+
 // Current returns the file as it is now, with its SHA-256 (hex).
 func (w *Writer) Current() ([]byte, string, error) {
+	if w.Remote != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		b, sum, err := w.Remote.Read(ctx)
+		if err == nil {
+			return b, sum, nil
+		}
+		// The cached copy remains useful for read-only display while the agent is disconnected. Writes still fail
+		// closed because they must reach Remote.Apply and pass its compare-and-swap check.
+		if cached, cacheErr := os.ReadFile(w.Path); cacheErr == nil {
+			return cached, sha(cached), nil
+		}
+		return nil, "", err
+	}
 	b, err := os.ReadFile(w.Path)
 	if err != nil {
 		return nil, "", err
@@ -125,7 +211,7 @@ func (w *Writer) Edit(ctx context.Context, author, reason string, guard Guard, e
 		return Result{}, err
 	}
 	defer unlock()
-	before, err := os.ReadFile(w.Path)
+	before, err := w.current(ctx)
 	if err != nil {
 		return Result{}, err
 	}
@@ -147,7 +233,7 @@ func (w *Writer) Replace(ctx context.Context, content []byte, expectSHA, author,
 		return Result{}, err
 	}
 	defer unlock()
-	before, err := os.ReadFile(w.Path)
+	before, err := w.current(ctx)
 	if err != nil {
 		return Result{}, err
 	}
@@ -207,7 +293,13 @@ func (w *Writer) finish(ctx context.Context, before, after []byte, author, reaso
 // apply writes after over from and, while MediaMTX answers, reads it back; when MediaMTX stops answering, restore
 // goes back in.
 func (w *Writer) apply(ctx, vctx context.Context, from, after, restore []byte, author, reason string, answering bool) (Result, error) {
-	snap, err := w.writeLocked(ctx, after, author, reason)
+	var snap store.Snapshot
+	var err error
+	if w.Remote != nil {
+		snap, err = w.writeRemoteLocked(ctx, restore, sha(from), after, author, reason)
+	} else {
+		snap, err = w.writeLocked(ctx, after, author, reason)
+	}
 	if err != nil {
 		return Result{}, err
 	}
@@ -225,7 +317,14 @@ func (w *Writer) apply(ctx, vctx context.Context, from, after, restore []byte, a
 			res.Applied = applied
 			break
 		}
-		restored, rerr := w.writeLocked(vctx, restore, "system", fmt.Sprintf("restored: MediaMTX stopped answering after version %d", snap.ID))
+		reason := fmt.Sprintf("restored: MediaMTX stopped answering after version %d", snap.ID)
+		var restored store.Snapshot
+		var rerr error
+		if w.Remote != nil {
+			restored, rerr = w.writeRemoteLocked(vctx, after, sha(after), restore, "system", reason)
+		} else {
+			restored, rerr = w.writeLocked(vctx, restore, "system", reason)
+		}
 		if rerr != nil {
 			return res, fmt.Errorf("MediaMTX stopped answering after version %d, and restoring the previous file failed: %w", snap.ID, rerr)
 		}
@@ -259,6 +358,9 @@ type Outcome struct {
 // reload and would crash-loop on the file at start). It runs before MediaMTX starts and then every few
 // seconds (Watch). It holds the writer's lock, so the sidecar's own writes never look like outside edits.
 func (w *Writer) Reconcile(ctx context.Context, seed []byte) (Outcome, error) {
+	if w.Remote != nil {
+		return w.reconcileRemote(ctx, seed)
+	}
 	unlock, err := w.lock()
 	if err != nil {
 		return Outcome{}, err
@@ -325,10 +427,86 @@ func (w *Writer) Reconcile(ctx context.Context, seed []byte) (Outcome, error) {
 	}, nil
 }
 
+func (w *Writer) reconcileRemote(ctx context.Context, seed []byte) (Outcome, error) {
+	unlock, err := w.lock()
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer unlock()
+	w.removeStaleTemps()
+	latest, snapErr := w.Store.LatestSnapshot(ctx)
+	if snapErr != nil && !errors.Is(snapErr, store.ErrNotFound) {
+		return Outcome{}, snapErr
+	}
+	current, sum, err := w.Remote.Read(ctx)
+	if err != nil {
+		if snapErr == nil {
+			if cacheErr := writeAtomic(w.Path, latest.Content); cacheErr != nil {
+				return Outcome{}, fmt.Errorf("remote agent is unavailable and restoring the local config cache failed: %w", cacheErr)
+			}
+			w.remember(latest.SHA256)
+			return Outcome{Message: "The remote management agent is unavailable; showing the last saved configuration. Remote changes are paused until it reconnects.", Notable: true}, nil
+		}
+		return Outcome{}, fmt.Errorf("reading the remote MediaMTX config: %w", err)
+	}
+	if verr := w.Validate(ctx, current); verr != nil {
+		if errors.Is(verr, context.Canceled) || errors.Is(verr, context.DeadlineExceeded) {
+			return Outcome{}, verr
+		}
+		restore := seed
+		what := "the initial config"
+		if snapErr == nil {
+			restore, what = latest.Content, fmt.Sprintf("snapshot %d", latest.ID)
+		}
+		if _, err := w.writeRemoteLocked(ctx, current, sum, restore, "system", "restored after an invalid remote edit: "+verr.Error()); err != nil {
+			return Outcome{}, fmt.Errorf("remote mediamtx.yml is invalid (%w) and restoring %s failed: %w", verr, what, err)
+		}
+		return Outcome{Message: fmt.Sprintf("The remote mediamtx.yml was changed to an invalid config (%v); restored %s", verr, what), Notable: true, Rejected: current}, nil
+	}
+	if err := writeAtomic(w.Path, current); err != nil {
+		return Outcome{}, err
+	}
+	if snapErr == nil && latest.SHA256 == sum {
+		w.remember(sum)
+		return Outcome{}, nil
+	}
+	if snapErr != nil {
+		if _, err := w.Store.InsertSnapshot(ctx, current, "system", "adopted remote config"); err != nil {
+			return Outcome{}, err
+		}
+		w.remember(sum)
+		return Outcome{Message: "adopted the remote MediaMTX config"}, nil
+	}
+	snap, err := w.Store.InsertSnapshot(ctx, current, "external", "remote config changed outside the sidecar")
+	if err != nil {
+		return Outcome{}, err
+	}
+	w.remember(sum)
+	return Outcome{Message: fmt.Sprintf("remote mediamtx.yml changed outside the sidecar; recorded snapshot %d", snap.ID), Notable: true}, nil
+}
+
 // Watch runs Reconcile every interval, skipping the work while the file's hash is the one last seen, and hands each
 // outcome that did something to report. After a change it looks again soon (settle), so that a change is judged
 // quickly once it holds still (look). It returns when ctx ends.
 func (w *Writer) Watch(ctx context.Context, interval time.Duration, seed []byte, report func(Outcome, error)) {
+	if w.Remote != nil {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				out, err := w.Reconcile(ctx, seed)
+				if ctx.Err() != nil {
+					return
+				}
+				if err != nil || out.Message != "" {
+					report(out, err)
+				}
+			}
+		}
+	}
 	settle := min(interval, 250*time.Millisecond)
 	t := time.NewTimer(interval)
 	defer t.Stop()
@@ -448,3 +626,6 @@ func writeAtomic(path string, content []byte) error {
 	defer d.Close()
 	return d.Sync()
 }
+
+// AtomicWrite is the fixed-file writer used by the remote agent's single configured MediaMTX config endpoint.
+func AtomicWrite(path string, content []byte) error { return writeAtomic(path, content) }

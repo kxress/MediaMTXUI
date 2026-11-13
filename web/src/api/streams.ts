@@ -29,6 +29,8 @@ export const streamSchema = z.object({
   /** The largest holding clip the server takes (for those who manage the stream). */
   holdingMaxBytes: z.number().optional(),
   canAdmin: z.boolean(),
+  /** Public HTTPS origin for MediaMTX's built-in browser page and direct WHIP/WHEP endpoints. */
+  mediaURL: z.string().optional(),
   ingest: z.object({
     host: z.string(),
     rtsp: z.number().optional(),

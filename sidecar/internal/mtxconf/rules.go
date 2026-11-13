@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"path"
 	"regexp"
 	"slices"
 	"sort"
@@ -18,7 +20,11 @@ import (
 // Rules are the sidecar's own checks, for what `mediamtx --validate-conf` does not catch (listener
 // conflicts, an empty file) and for the invariants the security model rests on.
 type Rules struct {
-	AuthURL string // authHTTPAddress must point here
+	AuthURL        string         // authHTTPAddress must point here
+	WebRTCOrigin   string         // when set, MediaMTX's WebRTC HTTP endpoints accept only this browser origin
+	RecordingsDir  string         // recordPath must stay under this MediaMTX-local directory; empty means /recordings
+	TrustedProxies []netip.Prefix // when set, each proxied listener must trust exactly these HTTP proxies
+	PrivateControl bool           // require API, metrics and playback listeners to be explicitly loopback-only
 }
 
 // Check returns every rule the config breaks.
@@ -40,6 +46,12 @@ func (r Rules) Check(content []byte) error {
 	if s, _ := conf["authHTTPAddress"].(string); s != r.AuthURL {
 		errs = append(errs, fmt.Errorf("authHTTPAddress must be %q", r.AuthURL))
 	}
+	if r.WebRTCOrigin != "" {
+		origins, ok := conf["webrtcAllowOrigins"].([]any)
+		if !ok || len(origins) != 1 || origins[0] != r.WebRTCOrigin {
+			errs = append(errs, fmt.Errorf("webrtcAllowOrigins must contain only %q", r.WebRTCOrigin))
+		}
+	}
 	if ex, ok := conf["authHTTPExclude"]; ok {
 		if list, isList := ex.([]any); !isList || len(list) > 0 {
 			errs = append(errs, errors.New("authHTTPExclude must be empty: an excluded action needs no credentials at all"))
@@ -51,10 +63,33 @@ func (r Rules) Check(content []byte) error {
 	if b, _ := asBool(conf["pprof"]); b {
 		errs = append(errs, errors.New("pprof must be off"))
 	}
+	if r.PrivateControl {
+		errs = append(errs, privateControlRules(conf)...)
+	}
 	errs = append(errs, listenerConflicts(conf)...)
 	errs = append(errs, internalOnPublished(conf)...)
-	errs = append(errs, pathRules(conf)...)
+	errs = append(errs, pathRules(conf, r.RecordingsDir)...)
+	if len(r.TrustedProxies) > 0 {
+		errs = append(errs, trustedProxyRules(conf, r.TrustedProxies)...)
+	}
 	return errors.Join(errs...)
+}
+
+func privateControlRules(conf map[string]any) []error {
+	var errs []error
+	for _, key := range []string{"apiAddress", "metricsAddress", "playbackAddress"} {
+		addr, ok := conf[key].(string)
+		if !ok {
+			errs = append(errs, fmt.Errorf("%s must bind to a loopback IP address in native or remote mode", key))
+			continue
+		}
+		host, _, err := net.SplitHostPort(addr)
+		ip, parseErr := netip.ParseAddr(host)
+		if err != nil || parseErr != nil || !ip.IsLoopback() {
+			errs = append(errs, fmt.Errorf("%s must bind to a loopback IP address in native or remote mode", key))
+		}
+	}
+	return errs
 }
 
 // listener is one socket MediaMTX opens.
@@ -177,16 +212,21 @@ func transportsInclude(v any, t string) bool {
 
 var recordPathVars = regexp.MustCompile(`%path`)
 
-func pathRules(conf map[string]any) []error {
+func pathRules(conf map[string]any, recordingsDir string) []error {
 	var errs []error
+	if recordingsDir == "" {
+		recordingsDir = "/recordings"
+	}
+	recordingsDir = path.Clean(recordingsDir)
+	recordingsPrefix := strings.TrimSuffix(recordingsDir, "/") + "/"
 	checkRecord := func(where string, p map[string]any) {
 		rp, ok := p["recordPath"].(string)
 		if !ok {
 			return
 		}
 		switch {
-		case !strings.HasPrefix(rp, "/recordings/"):
-			errs = append(errs, fmt.Errorf("%s: recordPath must be under /recordings/", where))
+		case !strings.HasPrefix(rp, recordingsPrefix):
+			errs = append(errs, fmt.Errorf("%s: recordPath must be under %s", where, recordingsPrefix))
 		case slices.Contains(strings.Split(rp, "/"), ".."):
 			errs = append(errs, fmt.Errorf(`%s: recordPath must not contain ".."`, where))
 		case !recordPathVars.MatchString(rp):
@@ -224,18 +264,65 @@ func pathRules(conf map[string]any) []error {
 // Locked are the global settings the sidecar depends on, with the reason. The UI shows them read-only and the
 // settings endpoint refuses them; the rules above (or a broken connection to MediaMTX) would catch a change anyway.
 var Locked = map[string]string{
-	"authMethod":          "MediaMTX asks the sidecar about every authentication.",
-	"authHTTPAddress":     "Points MediaMTX at the sidecar's authentication endpoint.",
-	"authHTTPExclude":     "Must stay empty: an excluded action would need no credentials at all.",
-	"authHTTPFingerprint": "The sidecar's authentication endpoint is plain HTTP on the stack network.",
-	"api":                 "The sidecar needs MediaMTX's Control API.",
-	"apiAddress":          "The sidecar reaches the Control API at this address.",
-	"apiEncryption":       "The sidecar talks to the Control API over the stack network.",
-	"pprof":               "Must stay off: it exposes MediaMTX's internals.",
-	"hlsAddress":          "The sidecar's live view reaches MediaMTX's HLS server at this address.",
-	"hlsEncryption":       "The sidecar talks to the HLS server over the stack network.",
-	"webrtcAddress":       "The sidecar's live view reaches MediaMTX's WebRTC signalling at this address.",
-	"webrtcEncryption":    "The sidecar talks to the WebRTC signalling over the stack network.",
+	"authMethod":             "MediaMTX asks the sidecar about every authentication.",
+	"authHTTPAddress":        "Points MediaMTX at the sidecar's authentication endpoint.",
+	"authHTTPExclude":        "Must stay empty: an excluded action would need no credentials at all.",
+	"authHTTPFingerprint":    "The sidecar's authentication endpoint is plain HTTP on the stack network.",
+	"api":                    "The sidecar needs MediaMTX's Control API.",
+	"apiAddress":             "The sidecar reaches the Control API at this address.",
+	"apiEncryption":          "The sidecar talks to the Control API over the stack network.",
+	"pprof":                  "Must stay off: it exposes MediaMTX's internals.",
+	"hlsAddress":             "The UI or media proxy reaches MediaMTX's HLS server at this address.",
+	"hlsEncryption":          "Controls TLS on MediaMTX's HLS listener; reverse proxies may terminate public TLS instead.",
+	"webrtcAddress":          "The UI or media proxy reaches MediaMTX's WebRTC signalling at this address.",
+	"webrtcEncryption":       "Controls TLS on MediaMTX's WebRTC signalling listener; reverse proxies may terminate public TLS instead.",
+	"hlsTrustedProxies":      "MediaMTX trusts only the configured reverse proxies when reading forwarded client addresses.",
+	"webrtcTrustedProxies":   "MediaMTX trusts only the configured reverse proxies when reading forwarded client addresses.",
+	"playbackTrustedProxies": "MediaMTX trusts only the configured reverse proxies when reading forwarded client addresses.",
+}
+
+func trustedProxyRules(conf map[string]any, expected []netip.Prefix) []error {
+	want := make([]string, 0, len(expected))
+	for _, prefix := range expected {
+		if !prefix.IsValid() || prefix.Bits() == 0 {
+			return []error{errors.New("trusted proxy addresses must not include every IP address")}
+		}
+		want = append(want, prefix.Masked().String())
+	}
+	slices.Sort(want)
+	var errs []error
+	for _, key := range []string{"hlsTrustedProxies", "webrtcTrustedProxies", "playbackTrustedProxies"} {
+		gotList, ok := conf[key].([]any)
+		got := make([]string, 0, len(gotList))
+		if ok {
+			for _, value := range gotList {
+				raw, isString := value.(string)
+				if !isString {
+					got = append(got, "<invalid>")
+					continue
+				}
+				prefix, err := netip.ParsePrefix(raw)
+				if err != nil {
+					if addr, addrErr := netip.ParseAddr(raw); addrErr == nil {
+						prefix = netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen())
+					} else {
+						got = append(got, "<invalid>")
+						continue
+					}
+				}
+				if prefix.Bits() == 0 {
+					got = append(got, "<all-addresses>")
+				} else {
+					got = append(got, prefix.Masked().String())
+				}
+			}
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			errs = append(errs, fmt.Errorf("%s must match the configured trusted proxy addresses", key))
+		}
+	}
+	return errs
 }
 
 // publishedPorts are the ports the compose files publish (the stream ports). MediaMTX's servers that must stay on the

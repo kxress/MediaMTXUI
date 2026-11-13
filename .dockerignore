@@ -1,7 +1,17 @@
-# Only web/ and sidecar/ go into the image build.
+# The build context is limited to the app, web frontend and native packaging files.
 *
 !web
 !sidecar
+!deploy
+deploy/*
+!deploy/native
+deploy/native/*
+!deploy/native/mtxui.service
+!deploy/native/mtxui-mediamtx.service
+!deploy/native/mtxui-agent.service
+!deploy/native/mtxui.env.example
+!deploy/native/mtxui-agent.env.example
+!deploy/native/mtxui-cli
 web/node_modules
 web/dist
 web/coverage

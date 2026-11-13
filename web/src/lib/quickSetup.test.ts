@@ -37,6 +37,9 @@ describe('WebRTC addresses', () => {
       protocol: 'WHIP',
       url: 'https://ui.example/whip/live/obs',
     })
+    expect(
+      rtcAddress('https://ui.vpn.example', {}, 'live/obs', 'publish', 'https://media.example'),
+    ).toEqual({ protocol: 'WHIP', url: 'https://media.example/live/obs/whip' })
     expect(rtcAddress('https://ui.example', {}, 'a b', 'read')?.url).toBe(
       'https://ui.example/whep/a%20b',
     )

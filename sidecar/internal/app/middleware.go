@@ -260,7 +260,7 @@ func (s *Server) loadSession(next http.Handler) http.Handler {
 // cross-site form cannot send.
 func (s *Server) csrf(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if auth.SafeMethod(r.Method) || externalRTC(r.URL.Path) {
+		if auth.SafeMethod(r.Method) || externalRTC(r.URL.Path) || (r.Method == http.MethodPost && r.URL.Path == "/agent/v1/auth") {
 			next.ServeHTTP(w, r)
 			return
 		}

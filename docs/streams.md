@@ -99,13 +99,13 @@ The addresses look like this (for a stream `live/alice` on `stream.example.com`,
 |---|---|---|
 | RTMP | OBS, Streamlabs and most encoders: the usual choice. | **Server** `rtmp://stream.example.com/live` and **Stream key** `alice?user=key-abc&pass=SECRET` |
 | SRT | Unstable connections (mobile, long distance): recovers lost packets. | **URL** `srt://stream.example.com:8890?streamid=publish:live/alice:key-abc:SECRET` |
-| WHIP | OBS 30+ (service WHIP): lowest delay to WebRTC viewers. | **Server** `https://your-ui-address/whip/live/alice` and **Bearer token** `key-abc:SECRET` |
+| WHIP | OBS 30+ (service WHIP): lowest delay to WebRTC viewers. | **Server** `https://media.example.net/live/alice/whip` and **Bearer token** `key-abc:SECRET` when a public MediaMTX URL is configured; older installs use the UI route. |
 | RTSP | Cameras and ffmpeg. | **URL** `rtsp://key-abc:SECRET@stream.example.com:8554/live/alice` |
 
 Notes:
 
 - The host in RTMP, SRT and RTSP addresses is the stream host your admin set during install (`MTXUI_PUBLIC_HOST`).
-  WHIP goes through the UI's own web address.
+  With `MTXUI_PUBLIC_MEDIA_URL`, WHIP and WHEP go directly to MediaMTX; without it, they use the UI's WebRTC routes.
 - RTMP is split the way OBS wants it: the last part of the path goes into the stream key, together with the
   credentials. A path without a slash (for example `church`) gives the server `rtmp://stream.example.com` and the key
   `church?user=...`.
@@ -227,6 +227,12 @@ New streams are public. A public stream:
 - can be read by outside players at its keyless addresses (RTSP, RTMP, SRT, WHEP),
 - still needs the stream key to stream to it. Public means watching only. It never allows publishing, and never
   playback of recordings.
+
+When `MTXUI_PUBLIC_MEDIA_URL` is set, the shared watch link opens MediaMTX's own WebRTC page on that public media
+origin, so a viewer does not need a route to the management UI. The media host can mark those pages `noindex` at its
+HTTPS reverse proxy. They remain publicly reachable by anyone with the URL; `noindex` is not access control. In
+remote-agent mode this setting is required, and direct browser/OBS signaling uses the MediaMTX origin rather than the
+UI host.
 
 To make a stream private, untick **Public** under **Settings** and click **Save**. The owner, operators and admins can
 do this. Anonymous viewers are disconnected within about 2 seconds, the watch link stops working ("There is no public

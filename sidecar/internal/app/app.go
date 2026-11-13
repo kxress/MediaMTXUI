@@ -32,30 +32,31 @@ import (
 
 // Deps are the components the HTTP layer uses.
 type Deps struct {
-	Settings *settings.Settings
-	Store    *store.Store
-	Sessions *auth.Sessions
-	Hasher   *auth.Hasher
-	Setup    *setup.Service
-	Probe    *probe.Prober
-	Audit    *audit.Recorder
-	Live     *live.Hub // MediaMTX's live state, for the event stream and the charts
-	Config   *mtxconf.Writer
-	NetGuard *netguard.Guard // vets the addresses config edits point MediaMTX at
-	Creds    *credentials.Service
-	Opened   Opened           // which sessions a credential authenticated
-	Kicker   Kicker           // closes MediaMTX sessions
-	MTX      MTXAPI           // MediaMTX's Control API with the sidecar's credentials (forward states, recordings)
-	Playback Playback         // MediaMTX's playback server with the sidecar's credentials (recording spans, exports)
-	Notes    *mtxlog.Notes    // what MediaMTX's log says about encoders (refused, B-frames)
-	Logs     *logs.Hub        // the log viewer's live tails and the sidecar's own recent lines
-	Watch    *liveproxy.Proxy // the live view's HLS and WHEP proxies
-	Exposure *portgate.Client // exposure control: desired.json out, mtx-portgate's status in
-	Proxy    http.Handler     // the MediaMTX API proxy; it sees paths with /api/mtx stripped
-	MTXAuth  http.Handler     // MediaMTX's authentication callback
-	UI       http.Handler     // the embedded single-page app
-	Restart  func()           // ends the process so it starts again (a restore); the container's restart policy brings it back
-	Log      *slog.Logger
+	Settings          *settings.Settings
+	Store             *store.Store
+	Sessions          *auth.Sessions
+	Hasher            *auth.Hasher
+	Setup             *setup.Service
+	Probe             *probe.Prober
+	Audit             *audit.Recorder
+	Live              *live.Hub // MediaMTX's live state, for the event stream and the charts
+	Config            *mtxconf.Writer
+	NetGuard          *netguard.Guard // vets the addresses config edits point MediaMTX at
+	Creds             *credentials.Service
+	Opened            Opened                  // which sessions a credential authenticated
+	Kicker            Kicker                  // closes MediaMTX sessions
+	MTX               MTXAPI                  // MediaMTX's Control API with the sidecar's credentials (forward states, recordings)
+	Playback          Playback                // MediaMTX's playback server with the sidecar's credentials (recording spans, exports)
+	Notes             *mtxlog.Notes           // what MediaMTX's log says about encoders (refused, B-frames)
+	Logs              *logs.Hub               // the log viewer's live tails and the sidecar's own recent lines
+	Watch             *liveproxy.Proxy        // the live view's HLS and WHEP proxies
+	AgentAuthVerifier RemoteAgentAuthVerifier // verifies the optional remote agent's authenticated callback relay
+	Exposure          *portgate.Client        // exposure control: desired.json out, mtx-portgate's status in
+	Proxy             http.Handler            // the MediaMTX API proxy; it sees paths with /api/mtx stripped
+	MTXAuth           http.Handler            // MediaMTX's authentication callback
+	UI                http.Handler            // the embedded single-page app
+	Restart           func()                  // ends the process so it starts again (a restore); the container's restart policy brings it back
+	Log               *slog.Logger
 	// HoldingClips knows the uploaded holding clips the sidecar has read (optional: tests may leave it out).
 	HoldingClips *HoldingClips
 }
@@ -72,6 +73,11 @@ type Playback interface {
 	Open(ctx context.Context, path string) (*http.Response, error)
 }
 
+// RemoteAgentAuthVerifier authenticates a bounded request body forwarded by a configured remote agent.
+type RemoteAgentAuthVerifier interface {
+	Verify(r *http.Request, body []byte) bool
+}
+
 // Server holds the HTTP layer's state: limiters, open event streams, the route registry and recent reverse-proxy
 // mismatches.
 type Server struct {
@@ -79,6 +85,7 @@ type Server struct {
 	resolver  *clientip.Resolver
 	loginRate *auth.RateLimiter
 	setupRate *auth.RateLimiter
+	joinRate  *auth.RateLimiter
 	lockout   *auth.Lockout
 	mediamtx  *peers
 	mismatch  mismatch
@@ -107,6 +114,7 @@ func New(d Deps) *Server {
 		recWake:   make(chan struct{}, 1),
 		loginRate: auth.NewRateLimiter(perMinute, max(5, perMinute/2)),
 		setupRate: auth.NewRateLimiter(10, 5),
+		joinRate:  auth.NewRateLimiter(d.Settings.JoinRatePerMinute, max(5, d.Settings.JoinRatePerMinute/2)),
 		lockout:   auth.NewLockout(d.Settings.LockoutThreshold, d.Settings.LockoutDuration),
 		mediamtx:  newPeers(d.Settings.MediaMTXHost),
 	}
@@ -162,13 +170,15 @@ func Run(ctx context.Context, l Listeners, public, internal http.Handler, log *s
 			return err
 		}
 		log.Info("listening", "addr", ln.Addr().String(), "tls", e.tls)
-		go func() {
-			if e.tls {
-				errc <- e.srv.ServeTLS(ln, "", "")
+		go func(srv *http.Server, ln net.Listener, useTLS bool) {
+			var err error
+			if useTLS {
+				err = srv.ServeTLS(ln, "", "")
 			} else {
-				errc <- e.srv.Serve(ln)
+				err = srv.Serve(ln)
 			}
-		}()
+			errc <- err
+		}(e.srv, ln, e.tls)
 	}
 	select {
 	case <-ctx.Done():

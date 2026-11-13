@@ -3,7 +3,8 @@
 # cross-compile on the runner (Dockerfile), so no emulation is needed. Provenance and the SBOM are buildx's, attached
 # to the image; there is no GitHub attestation, so no job needs an OIDC token.
 #
-# On a tag, the install files then go to the GitHub release (created if it does not exist yet), with the tag's section
+# On a tag, the Docker Compose and native Linux install files then go to the GitHub release (created if it does not
+# exist yet), with the tag's section
 # of CHANGELOG.md as its notes (checked first: without a section, nothing is published):
 # compose.yaml with the sidecar image pinned to that version, next to the MediaMTX image it pins already, so that the
 # README's install and upgrade always fetch a pair that was tested together; .env.example as env.example (GitHub
@@ -97,6 +98,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Pin the sidecar image in compose.yaml to this version
         env:
           TAG: ${{ github.ref_name }}
@@ -110,6 +112,13 @@ jobs:
           cp .env.example dist/env.example
           cp deploy/compose.behind-proxy.yaml deploy/compose.exposure.yaml deploy/compose.lan.yaml dist/
           cp scripts/install.sh dist/install.sh
+          cp scripts/install-native.sh scripts/install-native-agent.sh scripts/uninstall-native.sh dist/
+          docker buildx build --platform linux/amd64 --target native --build-arg VERSION="$TAG" --output type=local,dest=/tmp/mtxui-native-amd64 .
+          docker buildx build --platform linux/arm64 --target native --build-arg VERSION="$TAG" --output type=local,dest=/tmp/mtxui-native-arm64 .
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -czf dist/mtxui-linux-amd64.tar.gz -C /tmp/mtxui-native-amd64 usr
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -czf dist/mtxui-linux-arm64.tar.gz -C /tmp/mtxui-native-arm64 usr
+          rm -rf /tmp/mtxui-native-amd64 /tmp/mtxui-native-arm64
+          (cd dist && sha256sum mtxui-linux-amd64.tar.gz mtxui-linux-arm64.tar.gz >SHA256SUMS)
           scripts/release-notes.sh "$TAG" >notes.md
       - name: Attach them to the release
         env:

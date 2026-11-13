@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"slices"
 	"sort"
 	"strconv"
@@ -67,7 +66,7 @@ func (s *Server) frameSlots() chan struct{} {
 	return s.rec.frames
 }
 
-func (s *Server) recordingsRoot() string { return path.Join(s.d.Settings.DataDir, "recordings") }
+func (s *Server) recordingsRoot() string { return s.d.Settings.RecordingDataDir() }
 
 func (s *Server) exportSlots() chan struct{} {
 	s.rec.mu.Lock()
@@ -315,7 +314,11 @@ func (s *Server) recordingSpans(w http.ResponseWriter, r *http.Request) {
 		q.Set("end", end.UTC().Format(time.RFC3339Nano))
 	}
 	if s.d.Playback == nil {
-		writeError(w, http.StatusBadGateway, "mediamtx", "MediaMTX's playback server is not configured.")
+		message := "MediaMTX's playback server is not configured."
+		if s.d.Settings.MediaMTXAgentURL != nil {
+			message = "Recording playback is disabled in remote mode; recordings remain on the MediaMTX host."
+		}
+		writeError(w, http.StatusNotImplemented, "remote_media", message)
 		return
 	}
 	code, body, err := s.d.Playback.Get(r.Context(), "/list?"+q.Encode())
@@ -443,7 +446,11 @@ func (s *Server) recordingExport(w http.ResponseWriter, r *http.Request) {
 // (false) when it cannot. The caller closes the body.
 func (s *Server) openPlayback(ctx context.Context, w http.ResponseWriter, name string, start time.Time, secs float64, format string) (*http.Response, bool) {
 	if s.d.Playback == nil {
-		writeError(w, http.StatusBadGateway, "mediamtx", "MediaMTX's playback server is not configured.")
+		message := "MediaMTX's playback server is not configured."
+		if s.d.Settings.MediaMTXAgentURL != nil {
+			message = "Recording playback is disabled in remote mode; recordings remain on the MediaMTX host."
+		}
+		writeError(w, http.StatusNotImplemented, "remote_media", message)
 		return nil, false
 	}
 	get := url.Values{

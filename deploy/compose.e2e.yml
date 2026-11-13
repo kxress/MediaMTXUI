@@ -12,6 +12,7 @@ services:
       MTXUI_PUBLIC_URL: http://ui.mtxe2e.test:9080
       MTXUI_PUBLIC_HOST: mediamtx
       MTXUI_LOGIN_RATE_PER_MINUTE: "600" # the tests sign in many times from one address
+      MTXUI_JOIN_RATE_PER_MINUTE: "600" # many invited accounts join from the same test runner
       # Recordings on a 64 MB tmpfs with a small budget, checked often, so the tests see pruning and the guard.
       # The filler leaves about 2 MiB free; pruning then frees at most the budget, so free space stays under critical.
       MTXUI_RECORDINGS_MAX_GB: "0.004" # 4 MiB

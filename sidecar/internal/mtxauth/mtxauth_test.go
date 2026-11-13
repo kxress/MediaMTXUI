@@ -113,6 +113,32 @@ func TestDecide(t *testing.T) {
 	}
 }
 
+func TestRemoteAgentOnlyExtendsSidecarPrincipalTrust(t *testing.T) {
+	f := newFixture(t)
+	remoteIP := "198.51.100.25"
+	good := Request{IP: remoteIP, User: SidecarUser, Password: "sidecar-secret-for-tests", Action: "api"}
+	if got := f.h.Decide(context.Background(), good); got.Allow {
+		t.Fatal("local callback accepted a remote principal")
+	}
+	if got := f.h.DecideRemote(context.Background(), good); !got.Allow {
+		t.Fatalf("authenticated remote agent principal refused: %s", got.Reason)
+	}
+	bad := good
+	bad.Password = "wrong-secret"
+	if got := f.h.DecideRemote(context.Background(), bad); got.Allow {
+		t.Fatal("remote agent bypassed the sidecar principal secret")
+	}
+	bad = good
+	bad.Action = "publish"
+	if got := f.h.DecideRemote(context.Background(), bad); got.Allow {
+		t.Fatal("remote sidecar principal may publish")
+	}
+	streamer := Request{IP: remoteIP, User: "cam1", Password: f.pub, Action: "publish", Path: "cam1"}
+	if got := f.h.DecideRemote(context.Background(), streamer); !got.Allow {
+		t.Fatalf("remote client credentials stopped being checked: %s", got.Reason)
+	}
+}
+
 func TestThrottle(t *testing.T) {
 	own := netip.MustParseAddr("172.29.42.2")
 	f := newFixture(t, own)

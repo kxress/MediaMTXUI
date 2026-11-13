@@ -204,7 +204,7 @@ refuses changes to them:
 | `authMethod`, `authHTTPAddress`, `authHTTPExclude`, `authHTTPFingerprint` | MediaMTX asks the sidecar about every connection. Nothing may be excluded: an excluded action would need no credentials at all. |
 | `api`, `apiAddress`, `apiEncryption` | The sidecar needs MediaMTX's Control API, on the stack network. |
 | `pprof` | Must stay off: it exposes MediaMTX's internals. |
-| `hlsAddress`, `hlsEncryption`, `webrtcAddress`, `webrtcEncryption` | The UI's live view reaches MediaMTX's HLS and WebRTC signalling servers here, over the stack network. |
+| `hlsAddress`, `hlsEncryption`, `webrtcAddress`, `webrtcEncryption` | The UI or a media reverse proxy reaches MediaMTX's HLS and WebRTC signalling servers here. |
 
 In the YAML editor, the checks refuse any change to the authentication settings, `api` and `pprof`. Leave the
 addresses alone there too: the UI would lose its connection to MediaMTX.

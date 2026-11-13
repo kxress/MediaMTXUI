@@ -390,6 +390,10 @@ func (s *Server) syncHolding(ctx context.Context, st store.Stream, author, reaso
 // clip in another format replaces both versions (the old ones no longer match) and becomes the stream's format; the
 // stream keeps its audio when it has a version for it. The holding screen switches to the clip.
 func (s *Server) holdingUpload(w http.ResponseWriter, r *http.Request) {
+	if s.d.Settings.MediaMTXAgentURL != nil {
+		writeError(w, http.StatusNotImplemented, "remote_media", "Holding clip uploads are disabled in remote mode because clip storage stays on the MediaMTX host.")
+		return
+	}
 	ctx := r.Context()
 	st, cur, ok := s.streamFor(w, r, true)
 	if !ok {

@@ -1,0 +1,3 @@
+#!/bin/sh
+# The installed system's default data directory; override per command if the service uses a custom one.
+MTXUI_DATA_DIR="${MTXUI_DATA_DIR:-/var/lib/mtxui}" exec /usr/libexec/mtxui/mtxui "$@"

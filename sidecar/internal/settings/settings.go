@@ -3,6 +3,7 @@
 package settings
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,17 +30,34 @@ const (
 
 // Settings is the validated configuration.
 type Settings struct {
-	PublicURL      *url.URL       // how users reach the UI; decides cookie flags and the allowed Origin
-	PublicHost     string         // host stream clients connect to; offered to WebRTC clients
-	TrustedProxies []netip.Prefix // peers whose X-Forwarded-* headers are believed
-	StackSubnet    netip.Prefix   // the compose network; invalid (zero) means detect it
-	Listen         string         // public listener (HTTPS with TLS "acme")
-	InternalListen string         // internal listener: MediaMTX callbacks and the healthcheck
-	InternalURL    *url.URL       // how MediaMTX reaches the internal listener
-	MediaMTXHost   string         // MediaMTX's hostname on the stack network
-	DataDir        string
-	MediaMTXBin    string // the pinned MediaMTX binary, used only for --validate-conf
-	HoldingDir     string // holding clips; mounted at the same path in MediaMTX (read-only)
+	DeploymentMode         string         // docker or native; native enables stricter local MediaMTX listener rules
+	PublicURL              *url.URL       // how users reach the UI; decides cookie flags and the allowed Origin
+	PublicHost             string         // host stream clients connect to; offered to WebRTC clients
+	PublicMediaURL         *url.URL       // public HTTPS origin of MediaMTX's WebRTC page and WHIP/WHEP endpoints
+	TrustedProxies         []netip.Prefix // peers whose X-Forwarded-* headers are believed
+	StackSubnet            netip.Prefix   // network prefix MediaMTX trusts for proxied requests; invalid means detect
+	Listen                 string         // public listener (HTTPS with TLS "acme")
+	InternalListen         string         // internal listener: MediaMTX callbacks and the healthcheck
+	InternalURL            *url.URL       // how MediaMTX reaches the internal listener
+	MediaMTXHost           string         // host the application uses to reach MediaMTX's HTTP endpoints
+	MediaMTXAgentURL       *url.URL       // optional mTLS endpoint of the remote MediaMTX agent
+	MediaMTXAgentCA        string         // CA used to verify the remote agent
+	MediaMTXAgentCert      string         // client certificate presented to the remote agent
+	MediaMTXAgentKey       string         // client private key presented to the remote agent
+	MediaMTXAgentAuthURL   string         // loopback callback URL written to the remote MediaMTX config
+	RemoteAgentID          string         // agent allowed to forward the remote MediaMTX auth callback
+	RemoteAgentAuthKey     []byte         // HMAC key shared with that agent
+	MediaMTXControlHost    string         // bind host for MediaMTX's private HTTP listeners; empty preserves the Compose bind
+	MediaMTXMediaHost      string         // optional bind host for MediaMTX's HLS and WebRTC signalling listeners
+	MediaMTXWebRTCURL      *url.URL       // optional HTTPS upstream for remote WebRTC signalling
+	MediaMTXTrustedProxies []netip.Prefix // MediaMTX trusts forwarded source addresses only from these HTTP proxies
+	MediaMTXLogFile        string         // path as MediaMTX sees it
+	MediaMTXLogDataPath    string         // local path the app reads; empty uses DataDir/logs/mediamtx.log
+	MediaMTXRecordingsDir  string         // recording root as MediaMTX sees it
+	RecordingsDataDir      string         // local path the app reads; empty uses DataDir/recordings
+	DataDir                string
+	MediaMTXBin            string // the pinned MediaMTX binary, used only for --validate-conf
+	HoldingDir             string // holding clips; mounted at the same path in MediaMTX (read-only)
 	// Recordings: the budget, in bytes (0: none), the free space pruning keeps, and the free space below
 	// which recording is switched off; how often they are checked; and the caps on exports.
 	RecordingsMaxBytes      int64
@@ -74,6 +92,7 @@ type Settings struct {
 	SessionIdleTimeout   time.Duration
 	SessionMaxAge        time.Duration
 	LoginRatePerMinute   int
+	JoinRatePerMinute    int
 	LockoutThreshold     int
 	LockoutDuration      time.Duration
 }
@@ -88,8 +107,10 @@ type Var struct {
 
 // Vars lists every variable Load reads, in documentation order.
 var Vars = []Var{
-	{Name: "MTXUI_PUBLIC_URL", Required: true, Description: "URL of the UI as users reach it, e.g. `https://mtx.example.com`. Its scheme decides the cookies' `Secure` flag, and state-changing requests must come from its origin. No path, query or credentials."},
+	{Name: "MTXUI_DEPLOYMENT_MODE", Default: "docker", Description: "Runtime mode: `docker` preserves the existing Compose network defaults; `native` requires the MediaMTX Control API, metrics and playback listeners to be bound to loopback."},
+	{Name: "MTXUI_PUBLIC_URL", Required: true, Description: "URL of the management UI as administrators reach it, e.g. `https://ui.example.com`; it may be VPN-only. Its scheme decides the cookies' `Secure` flag, and state-changing requests must come from its origin. No path, query or credentials."},
 	{Name: "MTXUI_PUBLIC_HOST", Required: true, Description: "Hostname or IP address that stream clients connect to. Offered to WebRTC clients as the ICE host."},
+	{Name: "MTXUI_PUBLIC_MEDIA_URL", Description: "Optional public HTTPS origin for MediaMTX's browser page and direct WHIP/WHEP signaling, separate from the UI origin. Required in remote agent mode. Point it at MediaMTX's WebRTC HTTP listener or a TLS reverse proxy that forwards that listener; WebRTC ICE media must still reach the MediaMTX host directly."},
 	{Name: "MTXUI_TRUSTED_PROXIES", Description: "Comma-separated IPs or CIDRs of reverse proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` headers are believed. For a proxy on the Docker host, the gateway of the stack subnet. Trusting every address (`0.0.0.0/0`, `::/0`) is refused."},
 	{Name: "MTXUI_STACK_SUBNET", Description: "CIDR of the stack's Docker network, used for MediaMTX's trusted proxies. Detected from the sidecar's own address when not set."},
 	{Name: "MTXUI_LISTEN", Default: ":9080", Description: "Public listener (UI, API, proxies): HTTPS with `MTXUI_TLS=acme`, else plain HTTP to publish only behind your reverse proxy."},
@@ -102,8 +123,23 @@ var Vars = []Var{
 	{Name: "MTXUI_INTERNAL_LISTEN", Default: ":9081", Description: "Internal listener for MediaMTX's authentication callback and the healthcheck. Never publish it."},
 	{Name: "MTXUI_INTERNAL_URL", Default: "http://sidecar:9081", Description: "How MediaMTX reaches the internal listener; written into `mediamtx.yml` as the base of `authHTTPAddress`."},
 	{Name: "MTXUI_MEDIAMTX_HOST", Default: "mediamtx", Description: "MediaMTX's hostname on the stack network."},
+	{Name: "MTXUI_MEDIAMTX_AGENT_URL", Description: "Optional HTTPS origin of a remote mtxui agent, for example `https://media-agent.example.net:9443`. The agent relays only documented MediaMTX Control API operations over mutually authenticated TLS."},
+	{Name: "MTXUI_MEDIAMTX_AGENT_CA", Description: "Absolute path to the CA certificate that issued the remote agent's server certificate; required with MTXUI_MEDIAMTX_AGENT_URL."},
+	{Name: "MTXUI_MEDIAMTX_AGENT_CERT", Description: "Absolute path to the client certificate MediaMTXUI presents to the remote agent; required with MTXUI_MEDIAMTX_AGENT_URL."},
+	{Name: "MTXUI_MEDIAMTX_AGENT_KEY", Description: "Absolute path to the client private key MediaMTXUI presents to the remote agent; required with MTXUI_MEDIAMTX_AGENT_URL."},
+	{Name: "MTXUI_MEDIAMTX_AGENT_AUTH_URL", Description: "Loopback HTTP URL of the remote agent's local auth callback, for example `http://127.0.0.1:9081/internal/auth`; required with MTXUI_MEDIAMTX_AGENT_URL and must match MTXUI_AGENT_AUTH_LISTEN on that host."},
+	{Name: "MTXUI_REMOTE_AGENT_ID", Description: "Identifier of the agent allowed to forward MediaMTX authentication callbacks to this instance. Required with MTXUI_MEDIAMTX_AGENT_URL."},
+	{Name: "MTXUI_REMOTE_AGENT_AUTH_KEY", Description: "Hex-encoded 32-byte HMAC key shared with the remote agent for authenticated, replay-resistant MediaMTX callbacks; required with MTXUI_MEDIAMTX_AGENT_URL. Keep it secret and rotate it on both hosts together."},
+	{Name: "MTXUI_MEDIAMTX_CONTROL_HOST", Description: "Host address MediaMTX binds for its private Control API, metrics, and playback listeners. Empty keeps the Compose network bind; set to 127.0.0.1 for native local operation. Remote agent mode always locks these listeners to loopback."},
+	{Name: "MTXUI_MEDIAMTX_MEDIA_HOST", Description: "Optional host address MediaMTX binds for HLS and WebRTC signalling listeners. Empty follows MTXUI_MEDIAMTX_CONTROL_HOST for Docker and native local operation. Remote agent mode requires an explicit media bind address, separate from the loopback-only administrative APIs."},
+	{Name: "MTXUI_MEDIAMTX_WEBRTC_URL", Description: "Optional HTTPS origin used by the dashboard when forwarding WebRTC signalling. Required in remote agent mode so SDP offers, viewer tickets and session control are encrypted between the management and media hosts; it may point to MediaMTX TLS or an HTTPS reverse proxy."},
+	{Name: "MTXUI_MEDIAMTX_TRUSTED_PROXIES", Description: "Comma-separated IPs or CIDRs of reverse proxies MediaMTX sees in front of its HTTP listeners. MediaMTX trusts their X-Forwarded-For headers when binding credentials to the real publisher/viewer address; do not trust networks that can connect directly."},
 	{Name: "MTXUI_DATA_DIR", Default: "/data", Description: "Data root: `config/` (mediamtx.yml), `state/` (database and secrets), `logs/`, `recordings/`, `hooks/`, `backups/`."},
 	{Name: "MTXUI_HOLDING_DIR", Default: "/holding", Description: "Holding clips, played while nobody streams to a stream. MediaMTX must see the directory at the same path (read-only), since `mediamtx.yml` names the files by it."},
+	{Name: "MTXUI_MEDIAMTX_LOG_PATH", Default: "/logs/mediamtx.log", Description: "MediaMTX log file path as seen by MediaMTX. In local operation, set `MTXUI_MEDIAMTX_LOG_DATA_PATH` to the same host file."},
+	{Name: "MTXUI_MEDIAMTX_LOG_DATA_PATH", Description: "Local path MediaMTX UI reads for MediaMTX logs. Empty uses `MTXUI_DATA_DIR/logs/mediamtx.log`; native local operation can set this to the same host path as `MTXUI_MEDIAMTX_LOG_PATH`."},
+	{Name: "MTXUI_MEDIAMTX_RECORDINGS_DIR", Default: "/recordings", Description: "Recording directory as seen by MediaMTX. In local operation, set `MTXUI_RECORDINGS_DATA_DIR` to the same host directory; Docker keeps its existing `/recordings` volume."},
+	{Name: "MTXUI_RECORDINGS_DATA_DIR", Description: "Local path MediaMTX UI uses for recording disk accounting. Empty uses `MTXUI_DATA_DIR/recordings`; set it to the same host directory as `MTXUI_MEDIAMTX_RECORDINGS_DIR` for a native local instance."},
 	{Name: "MTXUI_RECORDINGS_MAX_GB", Default: "0", Description: "Storage budget for recordings in GB (decimals allowed); the oldest segments are deleted, through MediaMTX's API, to stay under it. 0 means no budget (free space still applies). Files MediaMTX does not list count toward it but are never deleted; a banner says so when they alone exceed it."},
 	{Name: "MTXUI_RECORDINGS_MIN_FREE_GB", Default: "20", Description: "Free space to keep on the recordings filesystem: below it, the oldest segments are deleted."},
 	{Name: "MTXUI_RECORDINGS_CRITICAL_FREE_GB", Default: "5", Description: "Free space below which recording is switched off for every path (with a banner and an audit entry) until an admin switches it back on. Less than MTXUI_RECORDINGS_MIN_FREE_GB, unless that is 0."},
@@ -123,6 +159,7 @@ var Vars = []Var{
 	{Name: "MTXUI_SESSION_IDLE_TIMEOUT", Default: "12h", Description: "A session ends after this long without a request (5m to 720h)."},
 	{Name: "MTXUI_SESSION_MAX_AGE", Default: "168h", Description: "A session ends this long after sign-in, however active (at least the idle timeout, at most 2160h)."},
 	{Name: "MTXUI_LOGIN_RATE_PER_MINUTE", Default: "20", Description: "Sign-in attempts allowed per client IP and minute (1 to 600)."},
+	{Name: "MTXUI_JOIN_RATE_PER_MINUTE", Default: "10", Description: "Account-join attempts allowed per client IP and minute (1 to 600)."},
 	{Name: "MTXUI_LOCKOUT_THRESHOLD", Default: "5", Description: "Failed sign-ins for one username from one client address before that address is locked out of it (1 to 100), so a stranger cannot lock you out everywhere. Unknown usernames lock the same way, so locks reveal nothing."},
 	{Name: "MTXUI_LOCKOUT_DURATION", Default: "15m", Description: "How long a locked username stays locked (1m to 24h)."},
 }
@@ -131,8 +168,10 @@ var Vars = []Var{
 func Load(getenv func(string) string) (*Settings, error) {
 	p := &parser{getenv: getenv}
 	s := &Settings{
+		DeploymentMode:          p.oneOf("MTXUI_DEPLOYMENT_MODE", "docker", "native"),
 		PublicURL:               p.publicURL("MTXUI_PUBLIC_URL"),
 		PublicHost:              p.host("MTXUI_PUBLIC_HOST"),
+		PublicMediaURL:          p.httpsOrigin("MTXUI_PUBLIC_MEDIA_URL"),
 		TrustedProxies:          p.prefixes("MTXUI_TRUSTED_PROXIES"),
 		StackSubnet:             p.prefix("MTXUI_STACK_SUBNET"),
 		Listen:                  p.listenAddr("MTXUI_LISTEN"),
@@ -145,9 +184,24 @@ func Load(getenv func(string) string) (*Settings, error) {
 		InternalListen:          p.listenAddr("MTXUI_INTERNAL_LISTEN"),
 		InternalURL:             p.internalURL("MTXUI_INTERNAL_URL"),
 		MediaMTXHost:            p.host("MTXUI_MEDIAMTX_HOST"),
+		MediaMTXAgentURL:        p.httpsOrigin("MTXUI_MEDIAMTX_AGENT_URL"),
+		MediaMTXAgentCA:         p.optionalAbsPath("MTXUI_MEDIAMTX_AGENT_CA"),
+		MediaMTXAgentCert:       p.optionalAbsPath("MTXUI_MEDIAMTX_AGENT_CERT"),
+		MediaMTXAgentKey:        p.optionalAbsPath("MTXUI_MEDIAMTX_AGENT_KEY"),
+		MediaMTXAgentAuthURL:    p.agentCallbackURL("MTXUI_MEDIAMTX_AGENT_AUTH_URL"),
+		RemoteAgentID:           p.get("MTXUI_REMOTE_AGENT_ID"),
+		RemoteAgentAuthKey:      p.hexKey("MTXUI_REMOTE_AGENT_AUTH_KEY"),
+		MediaMTXControlHost:     p.host("MTXUI_MEDIAMTX_CONTROL_HOST"),
+		MediaMTXMediaHost:       p.host("MTXUI_MEDIAMTX_MEDIA_HOST"),
+		MediaMTXWebRTCURL:       p.httpsOrigin("MTXUI_MEDIAMTX_WEBRTC_URL"),
+		MediaMTXTrustedProxies:  p.prefixes("MTXUI_MEDIAMTX_TRUSTED_PROXIES"),
 		DataDir:                 p.absPath("MTXUI_DATA_DIR"),
 		MediaMTXBin:             p.absPath("MTXUI_MEDIAMTX_BIN"),
 		HoldingDir:              p.absPath("MTXUI_HOLDING_DIR"),
+		MediaMTXLogFile:         p.absPath("MTXUI_MEDIAMTX_LOG_PATH"),
+		MediaMTXLogDataPath:     p.optionalAbsPath("MTXUI_MEDIAMTX_LOG_DATA_PATH"),
+		MediaMTXRecordingsDir:   p.absPath("MTXUI_MEDIAMTX_RECORDINGS_DIR"),
+		RecordingsDataDir:       p.optionalAbsPath("MTXUI_RECORDINGS_DATA_DIR"),
 		RecordingsMaxBytes:      p.gigabytes("MTXUI_RECORDINGS_MAX_GB"),
 		RecordingsMinFreeBytes:  p.gigabytes("MTXUI_RECORDINGS_MIN_FREE_GB"),
 		RecordingsCriticalBytes: p.gigabytes("MTXUI_RECORDINGS_CRITICAL_FREE_GB"),
@@ -165,11 +219,21 @@ func Load(getenv func(string) string) (*Settings, error) {
 		SessionIdleTimeout:      p.duration("MTXUI_SESSION_IDLE_TIMEOUT", 5*time.Minute, 720*time.Hour),
 		SessionMaxAge:           p.duration("MTXUI_SESSION_MAX_AGE", 5*time.Minute, 2160*time.Hour),
 		LoginRatePerMinute:      p.integer("MTXUI_LOGIN_RATE_PER_MINUTE", 1, 600),
+		JoinRatePerMinute:       p.integer("MTXUI_JOIN_RATE_PER_MINUTE", 1, 600),
 		LockoutThreshold:        p.integer("MTXUI_LOCKOUT_THRESHOLD", 1, 100),
 		LockoutDuration:         p.duration("MTXUI_LOCKOUT_DURATION", time.Minute, 24*time.Hour),
 	}
 	if s.Listen != "" && s.Listen == s.InternalListen {
 		p.fail("MTXUI_INTERNAL_LISTEN", "must differ from MTXUI_LISTEN")
+	}
+	if s.DeploymentMode == "native" && !loopbackHost(s.MediaMTXControlHost) {
+		p.fail("MTXUI_MEDIAMTX_CONTROL_HOST", "must be a loopback IP address in native mode")
+	}
+	if path.Clean(s.MediaMTXRecordingsDir) == "/" {
+		p.fail("MTXUI_MEDIAMTX_RECORDINGS_DIR", "must not be the filesystem root")
+	}
+	if s.RecordingsDataDir == "/" {
+		p.fail("MTXUI_RECORDINGS_DATA_DIR", "must not be the filesystem root")
 	}
 	if s.TLS == "acme" {
 		switch {
@@ -208,10 +272,46 @@ func Load(getenv func(string) string) (*Settings, error) {
 	if s.SessionMaxAge != 0 && s.SessionMaxAge < s.SessionIdleTimeout {
 		p.fail("MTXUI_SESSION_MAX_AGE", "must be at least MTXUI_SESSION_IDLE_TIMEOUT")
 	}
+	if s.MediaMTXAgentURL != nil {
+		if s.MediaMTXAgentCA == "" || s.MediaMTXAgentCert == "" || s.MediaMTXAgentKey == "" || s.MediaMTXAgentAuthURL == "" {
+			p.fail("MTXUI_MEDIAMTX_AGENT_CA, MTXUI_MEDIAMTX_AGENT_CERT, MTXUI_MEDIAMTX_AGENT_KEY, MTXUI_MEDIAMTX_AGENT_AUTH_URL", "must all be set when MTXUI_MEDIAMTX_AGENT_URL is set")
+		}
+		if s.RemoteAgentID == "" || len(s.RemoteAgentID) > 128 || strings.ContainsAny(s.RemoteAgentID, "\r\n\x00") {
+			p.fail("MTXUI_REMOTE_AGENT_ID", "must contain 1 to 128 characters and no CR, LF or NUL")
+		}
+		if len(s.RemoteAgentAuthKey) != 32 {
+			p.fail("MTXUI_REMOTE_AGENT_AUTH_KEY", "must be a 64-character hex key when MTXUI_MEDIAMTX_AGENT_URL is set")
+		}
+		if s.MediaMTXMediaHost == "" {
+			p.fail("MTXUI_MEDIAMTX_MEDIA_HOST", "must be set explicitly when MTXUI_MEDIAMTX_AGENT_URL is set")
+		}
+		if s.MediaMTXWebRTCURL == nil {
+			p.fail("MTXUI_MEDIAMTX_WEBRTC_URL", "must be an HTTPS origin when MTXUI_MEDIAMTX_AGENT_URL is set")
+		}
+		if s.PublicMediaURL == nil {
+			p.fail("MTXUI_PUBLIC_MEDIA_URL", "must be an HTTPS origin when MTXUI_MEDIAMTX_AGENT_URL is set")
+		}
+		if len(s.MediaMTXTrustedProxies) == 0 {
+			p.fail("MTXUI_MEDIAMTX_TRUSTED_PROXIES", "must include the address of the HTTPS proxy MediaMTX sees when MTXUI_MEDIAMTX_AGENT_URL is set")
+		}
+		if s.MediaMTXControlHost != "" && s.MediaMTXControlHost != "127.0.0.1" && s.MediaMTXControlHost != "::1" {
+			p.fail("MTXUI_MEDIAMTX_CONTROL_HOST", "must be loopback when MTXUI_MEDIAMTX_AGENT_URL is set")
+		}
+		if s.ExposureControl {
+			p.fail("MTXUI_EXPOSURE_CONTROL", "is local-host only and cannot be enabled with MTXUI_MEDIAMTX_AGENT_URL")
+		}
+	} else if s.MediaMTXAgentCA != "" || s.MediaMTXAgentCert != "" || s.MediaMTXAgentKey != "" || s.MediaMTXAgentAuthURL != "" || s.RemoteAgentID != "" || len(s.RemoteAgentAuthKey) != 0 {
+		p.fail("MTXUI_MEDIAMTX_AGENT_URL", "is required when remote agent TLS or authentication settings are set")
+	}
 	if err := errors.Join(p.errs...); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+func loopbackHost(host string) bool {
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.IsLoopback()
 }
 
 // Secure reports whether the UI is served over HTTPS, which decides the cookies' Secure flag and __Host- prefix.
@@ -220,8 +320,21 @@ func (s *Settings) Secure() bool { return s.PublicURL.Scheme == "https" }
 // Origin is the only origin allowed to make state-changing requests.
 func (s *Settings) Origin() string { return s.PublicURL.Scheme + "://" + s.PublicURL.Host }
 
-// MediaMTXLog is MediaMTX's log file (logFile in the seed config, under the shared logs directory).
-func (s *Settings) MediaMTXLog() string { return path.Join(s.DataDir, "logs", "mediamtx.log") }
+// MediaMTXLog is the local path the application uses to read and rotate MediaMTX's log.
+func (s *Settings) MediaMTXLog() string {
+	if s.MediaMTXLogDataPath != "" {
+		return s.MediaMTXLogDataPath
+	}
+	return path.Join(s.DataDir, "logs", "mediamtx.log")
+}
+
+// RecordingDataDir is the local directory used for recording storage accounting.
+func (s *Settings) RecordingDataDir() string {
+	if s.RecordingsDataDir != "" {
+		return s.RecordingsDataDir
+	}
+	return path.Join(s.DataDir, "recordings")
+}
 
 // BackupsDir holds the backups (encrypted).
 func (s *Settings) BackupsDir() string { return path.Join(s.DataDir, "backups") }
@@ -241,9 +354,41 @@ func (s *Settings) DBPath() string { return path.Join(s.StateDir(), "mtxui.db") 
 // AuthURL is where MediaMTX sends authentication requests (authHTTPAddress).
 func (s *Settings) AuthURL() string { return s.InternalURL.JoinPath("internal", "auth").String() }
 
+// MediaMTXAuthURL is the colocated agent callback in remote mode, otherwise the existing internal callback.
+func (s *Settings) MediaMTXAuthURL() string {
+	if s.MediaMTXAgentURL != nil {
+		return s.MediaMTXAgentAuthURL
+	}
+	return s.AuthURL()
+}
+
 // MediaMTXURL is the base URL of one of MediaMTX's HTTP listeners.
 func (s *Settings) MediaMTXURL(port int) string {
 	return "http://" + net.JoinHostPort(s.MediaMTXHost, strconv.Itoa(port))
+}
+
+// MediaMTXAPIURL is the Control API origin, or the authenticated management agent's API relay when configured.
+func (s *Settings) MediaMTXAPIURL() string {
+	if s.MediaMTXAgentURL != nil {
+		return strings.TrimSuffix(s.MediaMTXAgentURL.String(), "/") + "/v1/media"
+	}
+	return s.MediaMTXURL(MediaMTXAPIPort)
+}
+
+// MediaMTXWebRTCBaseURL is the WebRTC signalling origin, encrypted for remote management mode.
+func (s *Settings) MediaMTXWebRTCBaseURL() string {
+	if s.MediaMTXWebRTCURL != nil {
+		return s.MediaMTXWebRTCURL.String()
+	}
+	return s.MediaMTXURL(MediaMTXWebRTCPort)
+}
+
+// PublicMediaOrigin is the browser-reachable HTTPS origin for MediaMTX's WebRTC page and direct WHIP/WHEP endpoints.
+func (s *Settings) PublicMediaOrigin() string {
+	if s.PublicMediaURL == nil {
+		return ""
+	}
+	return s.PublicMediaURL.String()
 }
 
 type parser struct {
@@ -313,6 +458,50 @@ func (p *parser) internalURL(name string) *url.URL {
 		return nil
 	}
 	return &url.URL{Scheme: u.Scheme, Host: u.Host}
+}
+
+func (p *parser) httpsOrigin(name string) *url.URL {
+	v := p.get(name)
+	if v == "" {
+		return nil
+	}
+	u, err := url.Parse(v)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		p.fail(name, "must be an https:// origin without credentials, path, query or fragment")
+		return nil
+	}
+	return &url.URL{Scheme: "https", Host: u.Host}
+}
+
+func (p *parser) agentCallbackURL(name string) string {
+	v := p.get(name)
+	if v == "" {
+		return ""
+	}
+	u, err := url.Parse(v)
+	host := ""
+	if err == nil {
+		host = strings.Trim(u.Hostname(), "[]")
+	}
+	ip := net.ParseIP(host)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "/internal/auth" || (ip == nil || !ip.IsLoopback()) {
+		p.fail(name, "must be a loopback http:// URL ending in /internal/auth")
+		return ""
+	}
+	return u.String()
+}
+
+func (p *parser) hexKey(name string) []byte {
+	v := p.get(name)
+	if v == "" {
+		return nil
+	}
+	key, err := hex.DecodeString(v)
+	if err != nil || len(key) != 32 {
+		p.fail(name, "must be a 64-character hexadecimal encoding of 32 random bytes")
+		return nil
+	}
+	return key
 }
 
 var hostLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -407,6 +596,18 @@ func (p *parser) absPath(name string) string {
 	v := p.get(name)
 	if !path.IsAbs(v) || path.Clean(v) != v {
 		p.fail(name, "must be an absolute, clean path")
+		return ""
+	}
+	return v
+}
+
+func (p *parser) optionalAbsPath(name string) string {
+	v := p.get(name)
+	if v == "" {
+		return ""
+	}
+	if !path.IsAbs(v) || path.Clean(v) != v {
+		p.fail(name, "must be an absolute, clean path when set")
 		return ""
 	}
 	return v

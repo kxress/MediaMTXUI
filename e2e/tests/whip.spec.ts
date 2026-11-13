@@ -107,3 +107,66 @@ test('publish over WHIP and read over WHEP with stream credentials', async ({
   expect(await read(`Bearer ${token}`)).toBe('video delete 200')
   await request.dispose()
 })
+
+test('publish to and watch from MediaMTX directly without the UI routes', async ({
+  page,
+  playwright,
+}) => {
+  test.setTimeout(90_000)
+  const request = await playwright.request.newContext({ baseURL })
+  const csrf = await signIn(request)
+  const headers = { ...sameOrigin, 'X-CSRF-Token': csrf }
+  const stream = await request.post('/api/v1/streams', {
+    headers,
+    data: { name: 'e2e/direct-media' },
+  })
+  expect(stream.status(), await stream.text()).toBe(201)
+
+  const credential = await request.post('/api/v1/credentials', {
+    headers,
+    data: { name: 'e2e-direct-publisher', actions: ['publish'], paths: ['e2e/direct-media'] },
+  })
+  expect(credential.status(), await credential.text()).toBe(201)
+  const { secret } = (await credential.json()) as { secret: string }
+  recordSecret(secret)
+
+  // This browser page and its WHIP request use MediaMTX's public origin, not MediaMTXUI's /whip route.
+  await page.goto('http://mediamtx:8889/e2e/direct-media')
+  const published = await page.evaluate(async (token) => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 320
+    canvas.height = 240
+    const g = canvas.getContext('2d')
+    let n = 0
+    setInterval(() => {
+      if (!g) return
+      g.fillStyle = `hsl(${String((n += 7) % 360)} 80% 50%)`
+      g.fillRect(0, 0, 320, 240)
+    }, 33)
+    const source = canvas.captureStream(30)
+    const pc = new RTCPeerConnection()
+    for (const track of source.getTracks()) pc.addTransceiver(track, { direction: 'sendonly' })
+    await pc.setLocalDescription(await pc.createOffer())
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    const response = await fetch('/e2e/direct-media/whip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/sdp', Authorization: `Bearer ${token}` },
+      body: pc.localDescription?.sdp,
+    })
+    if (response.status !== 201) return `WHIP ${String(response.status)}`
+    await pc.setRemoteDescription({ type: 'answer', sdp: await response.text() })
+    ;(window as unknown as { directPublisher: RTCPeerConnection }).directPublisher = pc
+    return 'ok'
+  }, `e2e-direct-publisher:${secret}`)
+  expect(published).toBe('ok')
+
+  const viewer = await page.context().newPage()
+  await viewer.goto('http://mediamtx:8889/e2e/direct-media')
+  const video = viewer.locator('video').first()
+  await expect(video).toBeVisible()
+  await expect
+    .poll(() => video.evaluate((el) => (el as HTMLVideoElement).videoWidth), { timeout: 20_000 })
+    .toBeGreaterThan(0)
+  await viewer.close()
+  await request.dispose()
+})
