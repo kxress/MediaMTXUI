@@ -86,6 +86,8 @@ MTXUI_MEDIAMTX_TRUSTED_PROXIES=127.0.0.1/32
 
 `MTXUI_PUBLIC_URL` is the management UI origin and can resolve only inside the VPN. `MTXUI_PUBLIC_HOST` is the public media host advertised to stream clients and in ICE candidates. `MTXUI_PUBLIC_MEDIA_URL` must be an HTTPS origin reachable by viewers and OBS; it serves MediaMTX's own page and direct WHIP/WHEP signaling. `MTXUI_MEDIAMTX_WEBRTC_URL` is the HTTPS origin MediaMTXUI uses for its separate dashboard WebRTC proxy. They can be the same URL or different URLs. The reverse proxy must forward the WebRTC HTTP listener and add `X-Robots-Tag: noindex, nofollow, noarchive`; the MediaMTX HTTP listener must allow only the configured media origin for WebRTC browser requests. The proxy must not expose the Control API, metrics or playback listener. Set `MTXUI_MEDIAMTX_TRUSTED_PROXIES` to the proxy address MediaMTX sees, so MediaMTX can safely recover viewer addresses from `X-Forwarded-For`.
 
+The dashboard's preview proxy sends each viewer's address in `X-Forwarded-For`; MediaMTX binds its short-lived viewer ticket to that address. Make `MTXUI_MEDIAMTX_WEBRTC_URL` reach a proxy that preserves this header from the dashboard. If a public CDN replaces it with the dashboard host's address, preview offers are rejected. A split deployment can use a separate HTTPS listener reachable over the private VPN, restricted to the dashboard host, and configured to pass the dashboard's forwarded address unchanged. `MTXUI_PUBLIC_MEDIA_URL` remains the browser-facing route for public watch pages and OBS.
+
 For example, when Caddy runs on the media host and forwards HTTPS to MediaMTX's loopback WebRTC listener, a site block can look like this:
 
 ```caddyfile
